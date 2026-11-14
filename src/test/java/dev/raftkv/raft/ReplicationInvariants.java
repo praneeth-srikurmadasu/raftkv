@@ -23,7 +23,11 @@ import dev.raftkv.raft.log.LogEntry;
  *   <li><b>Committed entries never change:</b> once any node has an index committed with some
  *       term, no node ever commits a different term at that index.</li>
  *   <li><b>Leader Completeness:</b> if an entry is committed in a term, it is present in the
- *       logs of the leaders of all later terms. Checked when a node is first seen as leader.</li>
+ *       logs of the leaders of all <em>later</em> terms. Checked when a node is first seen as
+ *       leader. The term an entry was committed <em>in</em> is the term of the leader that first
+ *       committed it (which may be later than the entry's own term). A leader of an earlier term
+ *       can legitimately win its election after that commit, when its vote replies are delayed,
+ *       and it need not have the entry.</li>
  *   <li>commitIndex never decreases within one run of a node.</li>
  * </ul>
  */
@@ -38,6 +42,8 @@ final class ReplicationInvariants implements Runnable {
     private final SimulatedCluster cluster;
     private final Map<Key, Content> seenEntries = new HashMap<>();
     private final Map<Long, Long> committedTerm = new HashMap<>();
+    /** index -> the term in which it was first committed (the committing leader's term). */
+    private final Map<Long, Long> committedInTerm = new HashMap<>();
     private long maxCommitted;
     private final Map<Leadership, Long> leaderLastIndex = new HashMap<>();
     private final Map<RaftNode, Long> seenCommit = new IdentityHashMap<>();
@@ -84,6 +90,7 @@ final class ReplicationInvariants implements Runnable {
             }
             for (long i = before + 1; i <= commit; i++) {
                 long term = log.termAt(i);
+                committedInTerm.putIfAbsent(i, n.currentTerm()); // the first node to commit i is its leader
                 Long earlier = committedTerm.putIfAbsent(i, term);
                 if (earlier != null && earlier != term) {
                     throw new AssertionError("committed entry changed at index " + i + ": t" + earlier
@@ -98,12 +105,12 @@ final class ReplicationInvariants implements Runnable {
     private void checkLeaderCompleteness(RaftNode leader, TrackingLog log) {
         for (long i = 1; i <= maxCommitted; i++) {
             Long term = committedTerm.get(i);
-            if (term == null) {
-                continue;
+            if (term == null || committedInTerm.get(i) >= leader.currentTerm()) {
+                continue; // Leader Completeness only binds leaders of later terms
             }
             if (i > log.lastIndex() || !Objects.equals(log.termAt(i), term)) {
                 throw new AssertionError("Leader Completeness violated: new leader " + leader.id() + " of t"
-                        + leader.currentTerm() + " lacks committed entry " + i + "@t" + term);
+                        + leader.currentTerm() + " lacks entry " + i + "@t" + term + ", committed in t" + committedInTerm.get(i));
             }
         }
     }

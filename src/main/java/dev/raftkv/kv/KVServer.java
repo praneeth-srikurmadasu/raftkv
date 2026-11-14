@@ -10,6 +10,7 @@ import dev.raftkv.common.NodeId;
 import dev.raftkv.protocol.ClientReply;
 import dev.raftkv.protocol.ClientRequest;
 import dev.raftkv.protocol.ClientStatus;
+import dev.raftkv.raft.Bug;
 import dev.raftkv.raft.NotLeaderException;
 import dev.raftkv.raft.RaftNode;
 import dev.raftkv.raft.Role;
@@ -37,13 +38,23 @@ public final class KVServer {
     private final Transport transport;
     private final Clock clock;
     private final GroupId group;
+    private final KVStateMachine localStore;
     private long requests;
 
     public KVServer(RaftNode raft, Transport transport, Clock clock) {
+        this(raft, transport, clock, null);
+    }
+
+    /**
+     * @param localStore this replica's state machine; only used by the deliberately broken read
+     *                   path ({@link Bug#READ_FROM_LOCAL_STATE}) in tests, may be null
+     */
+    public KVServer(RaftNode raft, Transport transport, Clock clock, KVStateMachine localStore) {
         this.raft = Objects.requireNonNull(raft, "raft");
         this.transport = Objects.requireNonNull(transport, "transport");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.group = raft.group();
+        this.localStore = localStore;
     }
 
     /** Handles one message from a client; ignores anything that is not a {@link ClientRequest}. */
@@ -52,6 +63,9 @@ public final class KVServer {
             return;
         }
         requests++;
+        if (localStore != null && raft.config().has(Bug.READ_FROM_LOCAL_STATE) && answerLocally(envelope, request)) {
+            return;
+        }
         if (raft.role() != Role.LEADER) {
             reply(envelope, new ClientReply(request.sequence(), ClientStatus.NOT_LEADER, raft.leaderId().orElse(null), Bytes.EMPTY));
             return;
@@ -75,6 +89,22 @@ public final class KVServer {
                 reply(envelope, new ClientReply(request.sequence(), ClientStatus.NOT_LEADER, hint, Bytes.EMPTY));
             }
         });
+    }
+
+    /** The broken read path: answer a GET from whatever this replica happens to have applied. */
+    private boolean answerLocally(Envelope envelope, ClientRequest request) {
+        KVCommand command;
+        try {
+            command = KVCodec.decodeCommand(request.command());
+        } catch (CodecException e) {
+            return false;
+        }
+        if (!(command instanceof KVCommand.Get get)) {
+            return false;
+        }
+        Bytes result = KVCodec.encode(new KVResult.GetResult(localStore.peek(get.key())));
+        reply(envelope, new ClientReply(request.sequence(), ClientStatus.OK, null, result));
+        return true;
     }
 
     /** Client requests handled so far (metrics). */

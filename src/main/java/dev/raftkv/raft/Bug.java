@@ -39,5 +39,10 @@ public enum Bug {
     // ---- Milestone 5: KV sessions
 
     /** The KV state machine ignores cached results, so a retried request executes again. */
-    SESSION_DEDUP_DISABLED
+    SESSION_DEDUP_DISABLED,
+
+    // ---- Milestone 6: linearizability
+
+    /** Any server answers GET straight from its own state machine, without the log or a leadership check. */
+    READ_FROM_LOCAL_STATE
 }

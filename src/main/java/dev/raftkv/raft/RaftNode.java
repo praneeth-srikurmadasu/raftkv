@@ -213,13 +213,13 @@ public final class RaftNode {
         if (!running) {
             return;
         }
+        if (!(envelope.message() instanceof RaftMessage message)) {
+            return; // client traffic is handled by the server layer above Raft (KVServer)
+        }
         NodeId from = envelope.from();
         if (!envelope.group().equals(group) || !voters.contains(from) || from.equals(self)) {
             trace("ignored message from non-member " + from + " for " + envelope.group());
             return;
-        }
-        if (!(envelope.message() instanceof RaftMessage message)) {
-            return; // client traffic is handled by the server layer above Raft (KVServer)
         }
 
         // Thesis §4.2.3 leader stickiness: if we believe a leader is alive (we are it, or we
@@ -776,6 +776,10 @@ public final class RaftNode {
 
     public Set<NodeId> voters() {
         return voters;
+    }
+
+    public RaftConfig config() {
+        return config;
     }
 
     public Role role() {

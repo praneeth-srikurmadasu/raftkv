@@ -199,7 +199,7 @@ final class SimulatedCluster {
                 .build();
         running.put(id, node);
         if (kvMode) {
-            kvServers.put(id, new KVServer(node, transports.get(id), sim.clock()));
+            kvServers.put(id, new KVServer(node, transports.get(id), sim.clock(), (KVStateMachine) sm.delegate()));
         }
         node.start();
     }

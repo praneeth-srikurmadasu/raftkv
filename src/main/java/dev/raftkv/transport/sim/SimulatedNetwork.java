@@ -32,7 +32,10 @@ import dev.raftkv.transport.Transport;
  *   <li>drop a fraction of messages ({@link #setDropRate}),</li>
  *   <li>duplicate a fraction of messages ({@link #setDuplicateRate}),</li>
  *   <li>split nodes into partitions that cannot reach each other ({@link #partition}, {@link #isolate}, {@link #heal}),</li>
- *   <li>take a node down so it neither sends nor receives ({@link #setNodeUp}).</li>
+ *   <li>take a node down so it neither sends nor receives ({@link #setNodeUp}),</li>
+ *   <li>break a link in one direction only ({@link #blockOneWay}): A's messages to B are lost
+ *       while B's messages to A still arrive. Asymmetric failures are a classic source of bugs,
+ *       e.g. a leader that receives votes but whose heartbeats never arrive.</li>
  * </ul>
  * Link state is checked both when a message is sent and when it would be delivered, so a
  * partition that starts while a message is in flight drops it (like a broken TCP connection).
@@ -41,7 +44,7 @@ import dev.raftkv.transport.Transport;
  * That runs the production codec on every simulated message and guarantees that nodes
  * never share objects in memory, just as with a real network.
  *
- * <p>Fuller fault controls (asymmetric links, clock skew, disk faults) arrive in Milestone 6.
+ * <p>Disk faults live in {@code SimulatedDisk}; clock skew (for lease reads) arrives with Milestone 11.
  */
 public final class SimulatedNetwork {
 
@@ -51,6 +54,8 @@ public final class SimulatedNetwork {
     private final Set<NodeId> down = new HashSet<>();
     /** Partition id per node; nodes with different ids cannot talk. Absent = default partition 0. */
     private final TreeMap<NodeId, Integer> partitionOf = new TreeMap<>();
+    /** Directed links that are down: "from->to". */
+    private final java.util.TreeSet<String> blockedLinks = new java.util.TreeSet<>();
 
     private long minLatencyNanos = Duration.ofMillis(1).toNanos();
     private long maxLatencyNanos = Duration.ofMillis(10).toNanos();
@@ -172,16 +177,26 @@ public final class SimulatedNetwork {
         partition(List.of(node));
     }
 
-    /** Removes all partitions (down nodes stay down). */
+    /** Drops every message from {@code from} to {@code to}; the opposite direction still works. */
+    public void blockOneWay(NodeId from, NodeId to) {
+        requireRegistered(from);
+        requireRegistered(to);
+        blockedLinks.add(from + "->" + to);
+        sim.trace("net block " + from + "->" + to);
+    }
+
+    /** Removes all partitions and one-way blocks (down nodes stay down). */
     public void heal() {
         partitionOf.clear();
+        blockedLinks.clear();
         sim.trace("net heal");
     }
 
     /** True if a message from {@code from} to {@code to} can currently get through. */
     public boolean canReach(NodeId from, NodeId to) {
         return isUp(from) && isUp(to)
-                && partitionOf.getOrDefault(from, 0).equals(partitionOf.getOrDefault(to, 0));
+                && partitionOf.getOrDefault(from, 0).equals(partitionOf.getOrDefault(to, 0))
+                && !blockedLinks.contains(from + "->" + to);
     }
 
     // ------------------------------------------------------------------ stats

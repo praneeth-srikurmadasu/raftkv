@@ -23,9 +23,14 @@ This document grows with every milestone. It records **what** we built, **why** 
 ## 3. Architecture (so far)
 
 ```
+ Main / client.cli   process entry points (server, command-line client)
+ server     RaftHost                           groups of one process; routes by group id to each group's thread
+ kv         KVServer, KVStateMachine, sessions client requests ⇄ Raft proposals
+ raft       RaftNode, log/, storage/           the consensus core (single-threaded)
  protocol   sealed Message + MessageCodec      frames ⇄ messages
  codec      BinaryWriter/Reader, FrameCodec    bytes  ⇄ frames
- transport  Transport ── SimulatedNetwork      (NioTransport in M7)
+ transport  Transport ── SimulatedNetwork | NioTransport
+ io         Disk ── SimulatedDisk | RealDisk
  sim        Simulation                         virtual time, seeded event order, trace hash
  common     Clock, Scheduler, Bytes, ids, Hashing, EventLoopScheduler
 ```
@@ -94,6 +99,30 @@ This document grows with every milestone. It records **what** we built, **why** 
 | Client retries | Same sequence number; exponential backoff with full jitter; overall deadline | Fixed retry delay | Jitter avoids synchronized retry storms after a leader change. |
 | Client threading | All state on one event loop; async API; blocking helpers for non-loop callers | Locks | Same model as the server; deterministic in simulation. |
 
+### Key decisions (Milestone 6)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Checker algorithm | Wing & Gong search with Lowe's memoization (the Porcupine algorithm), per key | Brute-force permutations; Knossos-style WGL without memo | Linearizability is local, so per-key checking is exact; memoization keeps searches in milliseconds. |
+| Unknown outcomes | Return time = ∞, any answer accepted; unknown GETs dropped | Treat timeouts as failures | The only correct choice: a timed-out write may or may not have happened. |
+| Bounding unknowns | A client that times out is retired and replaced (max 3 per run) | Let clients keep retrying | Each unknown op stays open forever in the search; Jepsen does the same. |
+| Verdicts | linearizable / proven violation / inconclusive (budget exceeded = failure) | Treat budget exhaustion as pass or as bug found | Never claim a result the search didn't prove. |
+| Workload | 35% PUT, 35% GET, 20% CAS, 10% DELETE on 2-4 keys, unique values | Many keys | Few keys = many conflicts = interesting histories; unique values make stale reads unambiguous. |
+| Faults | Swarm: each fault type on/off per seed, incl. one-way link failures | One fixed mix | Swarm testing finds bugs that a fixed blend of faults dilutes. |
+
+### Key decisions (Milestone 7)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| I/O model | One NIO selector thread; frames encoded on the caller's thread | Thread per connection; Netty | JDK only; scales to many groups and clients per process. |
+| Connection identity | 9-byte handshake `RKV1`, version, NodeId; connections keyed by remote id, whoever dialed | Separate inbound/outbound links per peer | Replies to clients reuse the client's connection; servers never need client addresses. |
+| Duplicate connections | Newest established connection becomes the route; older ones keep receiving until closed | Tie-break by id and close one | Simple and race-free; both connections are valid TCP streams. |
+| Failure handling | Best effort: broken connection → drop its queue, redial with exponential backoff + full jitter (50 ms base, 2 s cap) | Retransmit in the transport | Raft already retransmits; the transport promises nothing more (same contract as SimulatedNetwork). |
+| Memory bounds | ≤ 1,024 frames waiting for a dial; ≤ 64 MiB queued per connection; then drop | Unbounded queues | A dead or slow peer must not exhaust memory. |
+| Threads | Selector thread → `RaftHost` → one `EventLoopScheduler` per group | Shared pool | Keeps the Raft core single-threaded and lock-free, as in the simulator. |
+| Fatal errors | Event-loop error handler halts the process (fail-stop) | Log and continue | After a failed fsync the on-disk state is unknown; restart and recover instead. |
+| Client node ids | Random id ≥ 2²⁴ announced in the handshake | Separate client protocol | Same framing and code path as peers; ids can't collide with server ids in practice. |
+
 ### Known limitation (until Milestone 11)
 A node that misses heartbeats (briefly partitioned) can time out right after it reconnects; its higher term then makes the healthy leader step down through Fig. 2's "higher term → follower" rule. Safety is unaffected, but it costs an election. Pre-vote removes this. The chaos test lets the group settle for 2 s after healing before checking stability.
 
@@ -107,3 +136,8 @@ A node that misses heartbeats (briefly partitioned) can time out right after it 
 6. **Durable state machine.** The state machine is still rebuilt by replaying the log after a restart; persisting it is the job of snapshots (Milestone 8).
 7. **No session registration.** SPEC §4.2 allows registering sessions through the log; clients instead pick a random 128-bit id and the first request (with `ackedBelow == 1`) creates the session. Losing a session is still detected (`ackedBelow > 1` on an unknown client → `SESSION_EXPIRED`).
 8. **RaftLog is not AutoCloseable.** It has a plain `close()` so IDEs don't flag every in-memory or node-owned log as a resource leak.
+9. **One listening port.** SPEC §5.2 suggests separate ports for peer and client RPCs. One port serves both; the handshake's node id tells them apart. A second port can be added when there's a reason (e.g. firewalling clients from peers).
+10. **No correlation-id request futures in the transport.** SPEC §5.2 describes request/response matching by correlation id inside the transport. The transport is one-way messaging; `RaftKVClient` already matches replies by sequence number and has its own timeouts, so frames carry correlation id 0.
+11. **Back-pressure drops instead of replying `OVERLOADED`.** Per-connection write queues are bounded (64 MiB), but a full queue drops frames rather than surfacing `OVERLOADED` to clients. Admission control comes with the performance work (Milestone 11).
+12. **fsync on the group's event loop.** SPEC §3.2 prefers slow work off the event loop. The log's group-commit flush runs on the group's own thread; with one group per process this costs nothing measurable. Moving fsync to a dedicated thread is part of Milestone 11.
+13. **Coalesced heartbeats** (SPEC §5.2 stretch goal) are deferred until there are many groups per process (Milestone 9+).

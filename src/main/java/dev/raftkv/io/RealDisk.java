@@ -26,13 +26,8 @@ public final class RealDisk implements Disk {
 
     /** The caller owns the returned file and must close it. */
     @Override
-    @SuppressWarnings("resource")
     public DiskFile open(Path path) {
-        try {
-            return new RealFile(FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE));
-        } catch (IOException e) {
-            throw new DiskException("cannot open " + path, e);
-        }
+        return new RealFile(path); // the RealFile owns the channel it opens
     }
 
     @Override
@@ -93,8 +88,12 @@ public final class RealDisk implements Disk {
     private static final class RealFile implements DiskFile {
         private final FileChannel ch;
 
-        RealFile(FileChannel ch) {
-            this.ch = ch;
+        RealFile(Path path) {
+            try {
+                this.ch = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            } catch (IOException e) {
+                throw new DiskException("cannot open " + path, e);
+            }
         }
 
         @Override

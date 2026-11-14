@@ -73,10 +73,11 @@ public final class SegmentedFileLog implements RaftLog {
         final LongArray terms = new LongArray();
         boolean dirty;
 
-        Segment(long firstIndex, Path path, DiskFile file) {
+        /** Opens (creating if needed) the segment file; the segment owns it until {@code file.close()}. */
+        Segment(long firstIndex, Path path, Disk disk) {
             this.firstIndex = firstIndex;
             this.path = path;
-            this.file = file;
+            this.file = disk.open(path);
         }
     }
 
@@ -375,9 +376,8 @@ public final class SegmentedFileLog implements RaftLog {
     }
 
     /** The returned segment owns the open file; {@link #close()} (or truncation) closes it. */
-    @SuppressWarnings("resource")
     private Segment openSegment(long firstIndex, Path path) {
-        return new Segment(firstIndex, path, disk.open(path));
+        return new Segment(firstIndex, path, disk);
     }
 
     private Segment segmentFor(long index) {
