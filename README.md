@@ -4,7 +4,7 @@ A sharded, fault-tolerant distributed key-value store built on the Raft consensu
 
 [![CI](https://github.com/praneeth-srikurmadasu/raftkv/actions/workflows/ci.yml/badge.svg)](https://github.com/praneeth-srikurmadasu/raftkv/actions/workflows/ci.yml)
 
-> **Status:** Milestone 1 (foundations) complete. The full plan is in [SPEC.md](SPEC.md).
+> **Status:** Milestone 2 (leader election) complete. The full plan is in [SPEC.md](SPEC.md).
 
 ## Progress
 
@@ -12,8 +12,8 @@ A sharded, fault-tolerant distributed key-value store built on the Raft consensu
 |---|---|---|
 | 0 | Project setup: build, wrapper, docs, smoke tests | ✅ |
 | 1 | Skeleton, injectable clock/scheduler, binary codec, deterministic simulation | ✅ |
-| 2 | Leader election | ⏳ next |
-| 3 | Log replication | |
+| 2 | Leader election | ✅ |
+| 3 | Log replication | ⏳ next |
 | 4 | Persistence (MetaStore, segmented log, simulated disk) | |
 | 5 | KV state machine, sessions, client library | |
 | 6 | Linearizability checker + chaos suite | |
@@ -50,7 +50,9 @@ raftkv/
 │   ├── common/              Bytes, NodeId, GroupId, Clock, Scheduler, Hashing, EventLoopScheduler
 │   ├── codec/               BinaryWriter/Reader, Frame, FrameCodec, FrameDecoder
 │   ├── protocol/            sealed Message, the 7 Raft messages, MessageCodec
-│   ├── raft/log/            LogEntry, EntryType
+│   ├── raft/                RaftNode (election), RaftConfig, Role, Bug
+│   │   ├── log/             RaftLog, InMemoryLog, LogEntry, EntryType
+│   │   └── storage/         PersistentState, MetaStore, InMemoryMetaStore
 │   ├── sim/                 Simulation (virtual time, seeded event order, trace hash)
 │   └── transport/           Transport interface; sim/SimulatedNetwork
 ├── src/test/java/dev/raftkv/    tests (same package layout)
@@ -68,6 +70,7 @@ Every simulation test prints its seed when it fails. Re-run exactly that executi
 
 ```powershell
 .\mvnw.cmd test "-Dtest=DeterminismTest" "-Draftkv.seed=8812734"
+.\mvnw.cmd test "-Dtest=ElectionChaosTest" "-Draftkv.seeds=5000"   # more chaos seeds
 ```
 
 ## License

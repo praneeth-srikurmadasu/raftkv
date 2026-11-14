@@ -10,12 +10,14 @@ import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Random;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 import dev.raftkv.common.Cancellable;
 import dev.raftkv.common.Clock;
 import dev.raftkv.common.Hashing;
 import dev.raftkv.common.ManualClock;
 import dev.raftkv.common.Scheduler;
+import dev.raftkv.common.Tracer;
 
 /**
  * A deterministic discrete-event simulator: the heart of RaftKV's test strategy (SPEC §3.2, §9.2).
@@ -36,7 +38,7 @@ import dev.raftkv.common.Scheduler;
  *
  * <p>Not thread-safe by design: everything runs on one thread.
  */
-public final class Simulation implements Scheduler {
+public final class Simulation implements Scheduler, Tracer {
 
     private static final int RECENT_TRACE_LIMIT = 200;
 
@@ -50,6 +52,8 @@ public final class Simulation implements Scheduler {
     private final ManualClock clock = new ManualClock();
     private final PriorityQueue<Event> queue = new PriorityQueue<>(ORDER);
     private final ArrayDeque<String> recentTrace = new ArrayDeque<>();
+    private final List<Runnable> invariants = new ArrayList<>();
+    private Consumer<String> traceSink;
     private long nextSequence;
     private long eventsRun;
     private long traceHash = Hashing.FNV64_OFFSET_BASIS;
@@ -120,6 +124,9 @@ public final class Simulation implements Scheduler {
         eventsRun++;
         try {
             event.task.run();
+            for (Runnable invariant : invariants) {
+                invariant.run();
+            }
         } catch (RuntimeException | Error e) {
             throw new SimulationException("event failed at t=" + formatTime(clock.nanos())
                     + " (re-run with -Draftkv.seed=" + seed + ")", e);
@@ -160,9 +167,19 @@ public final class Simulation implements Scheduler {
     }
 
     /**
+     * Registers a check that runs after <em>every</em> event (SPEC §9.3). A check reports a
+     * violation by throwing; the simulation then fails with the seed and virtual time, so
+     * the exact moment a safety property broke can be replayed.
+     */
+    public void addInvariant(Runnable check) {
+        invariants.add(Objects.requireNonNull(check, "check"));
+    }
+
+    /**
      * Records an event in the trace. Folded into {@link #traceHash()} together with the current
      * virtual time; the most recent entries are kept for failure reports.
      */
+    @Override
     public void trace(String event) {
         String line = clock.nanos() + " " + event;
         traceHash = Hashing.fnv1a64(traceHash, line.getBytes(StandardCharsets.UTF_8));
@@ -170,7 +187,19 @@ public final class Simulation implements Scheduler {
         if (recentTrace.size() == RECENT_TRACE_LIMIT) {
             recentTrace.removeFirst();
         }
-        recentTrace.addLast(formatTime(clock.nanos()) + " " + event);
+        String formatted = formatTime(clock.nanos()) + " " + event;
+        recentTrace.addLast(formatted);
+        if (traceSink != null) {
+            traceSink.accept(formatted);
+        }
+    }
+
+    /**
+     * Also sends every trace line to {@code sink} as it happens (null to stop). Handy when
+     * replaying a failing seed: {@code sim.echoTraceTo(System.out::println)}.
+     */
+    public void echoTraceTo(Consumer<String> sink) {
+        this.traceSink = sink;
     }
 
     /** Hash of every traced event so far. Same seed + same code = same hash. */

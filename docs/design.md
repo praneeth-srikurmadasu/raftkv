@@ -42,8 +42,24 @@ This document grows with every milestone. It records **what** we built, **why** 
 | Event ordering in simulation | `(time, seeded tie-breaker, sequence)` | Insertion order for ties | Seeded tie-breaking explores different interleavings of simultaneous events across seeds while staying reproducible per seed. |
 | Simulated messages | Encoded and decoded on every hop | Pass objects directly | Exercises the production codec constantly and guarantees nodes never share mutable state. |
 
+### Key decisions (Milestone 2)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Persisting term/vote | Synchronous `MetaStore.save` on the event loop, before the dependent message is sent | Async fsync with completion events | Simplest correct ordering; Milestone 4 revisits this with real fsync costs. |
+| Candidate retries | Re-send RequestVote every heartbeat interval to peers that haven't answered | One-shot requests | §5.1 asks for retries; one lost message would otherwise waste a whole election timeout. |
+| Leader stickiness | Reject RequestVote without adopting its term when we are leader, or heard from the leader within `electionTimeoutMin` | No stickiness until pre-vote | Stops removed/rejoining servers from forcing elections and is needed later for lease reads (SPEC §3.4 d). |
+| Same-term second leader | `IllegalStateException` in the node | Silently follow | Two leaders in a term means Election Safety is broken; failing loudly lets the simulation report the seed. |
+| Invariant checks | Run after every simulated event via `Simulation.addInvariant` | Check only at the end of a run | A violation is reported at the exact moment it happens, with the seed and virtual time. |
+| Debugging aid | `Simulation.echoTraceTo(sink)` streams every trace line | Only the last 200 lines | Needed to understand failures that start long before they are detected. |
+
+### Known limitation (until Milestone 11)
+A node that misses heartbeats (briefly partitioned) can time out right after it reconnects; its higher term then makes the healthy leader step down through Fig. 2's "higher term → follower" rule. Safety is unaffected, but it costs an election. Pre-vote removes this. The chaos test lets the group settle for 2 s after healing before checking stability.
+
 ## 4. Deviations from SPEC.md
 
 1. **Message package.** SPEC places `Message` in `codec/` and the RPC records in `raft/rpc/`. Java only allows a `sealed` interface to permit classes in *other* packages when the code is a named module (`module-info.java`); in an ordinary classpath project all permitted classes must share one package. Adding a module would complicate testing for no real benefit, so `Message`, all message records and `MessageCodec` live together in `dev.raftkv.protocol`. `codec/` keeps the generic byte- and frame-level code.
 2. **Simulation location.** SPEC lists `Simulation` under the test tree but `SimulatedNetwork` under `src/main`. Since the network depends on the simulation, both live in `src/main` (`dev.raftkv.sim`, `dev.raftkv.transport.sim`). This also lets the benchmarks and demos reuse them.
 3. **Correlation ids for Raft.** SPEC §5.2 describes request/response matching by correlation id. Raft messages don't use it (see "communication style" above); it remains in the frame for client RPCs.
+4. **Bug switches.** SPEC §9.6 describes `static final` flags enabled through a separate build profile. Instead, bugs are an `EnumSet` inside `RaftConfig` (`RaftConfig.defaults()` has none). This lets one test run compare buggy and correct code side by side with no special build, at the cost of one set lookup per guarded line. Only test code ever enables a bug.
+5. **Milestone 2 heartbeats.** Followers already run the Figure 2 consistency check on heartbeats and reply success/failure, but don't append entries yet; that is Milestone 3.
