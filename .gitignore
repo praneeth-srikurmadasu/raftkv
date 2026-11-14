@@ -1,0 +1,32 @@
+# Build output
+target/
+
+# jqwik stores failing samples here between runs
+.jqwik-database
+
+# Simulation traces written by failing tests
+sim-traces/
+
+# Bundle leftovers
+*.unbundle-tmp
+*.bundle
+
+# IDEs / editors
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.factorypath
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime data of locally started nodes
+data/
+*.log

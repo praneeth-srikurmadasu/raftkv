@@ -1,0 +1,15 @@
+# Store text files with LF in the repository, whatever OS commits them.
+* text=auto eol=lf
+
+# Windows batch files must keep CRLF or cmd.exe can misread labels.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Shell scripts must keep LF or bash fails with "\r: command not found".
+*.sh  text eol=lf
+mvnw  text eol=lf
+
+# Binary files: never touch line endings.
+*.jar binary
+*.png binary
+*.gif binary
