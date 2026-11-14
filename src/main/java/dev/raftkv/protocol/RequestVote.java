@@ -17,7 +17,7 @@ import dev.raftkv.common.NodeId;
  * @param leadershipTransfer thesis §3.10: sent after TimeoutNow; voters skip the leader-stickiness check
  */
 public record RequestVote(long term, NodeId candidateId, long lastLogIndex, long lastLogTerm,
-                          boolean preVote, boolean leadershipTransfer) implements Message {
+                          boolean preVote, boolean leadershipTransfer) implements RaftMessage {
 
     public RequestVote {
         nonNegative(term, "term");

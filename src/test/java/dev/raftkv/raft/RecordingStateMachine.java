@@ -19,12 +19,23 @@ final class RecordingStateMachine implements StateMachine {
 
     private final NodeId node;
     private final Map<Long, Bytes> globallyApplied;
+    private final StateMachine delegate;
     private final List<Applied> applied = new ArrayList<>();
     private long lastIndex;
 
     RecordingStateMachine(NodeId node, Map<Long, Bytes> globallyApplied) {
+        this(node, globallyApplied, null);
+    }
+
+    /** Records and checks, then lets {@code delegate} (e.g. the KV store) do the real work. */
+    RecordingStateMachine(NodeId node, Map<Long, Bytes> globallyApplied, StateMachine delegate) {
         this.node = node;
         this.globallyApplied = globallyApplied;
+        this.delegate = delegate;
+    }
+
+    StateMachine delegate() {
+        return delegate;
     }
 
     @Override
@@ -39,7 +50,7 @@ final class RecordingStateMachine implements StateMachine {
                     + earlier.toUtf8() + " elsewhere but as " + command.toUtf8() + " on " + node);
         }
         applied.add(new Applied(index, command));
-        return Bytes.ofUtf8("ok:" + command.toUtf8());
+        return delegate != null ? delegate.apply(index, command) : Bytes.ofUtf8("ok:" + command.toUtf8());
     }
 
     List<Applied> applied() {

@@ -1,7 +1,8 @@
 package dev.raftkv.protocol;
 
 /**
- * Every message that can travel between RaftKV processes.
+ * Every message that can travel between RaftKV processes: Raft's own messages between servers
+ * ({@link RaftMessage}) and client requests/replies ({@link ClientRequest}, {@link ClientReply}).
  *
  * <p>{@code sealed} means the compiler knows the complete list of message types. A
  * {@code switch} over a {@code Message} with no {@code default} branch is checked for
@@ -9,19 +10,9 @@ package dev.raftkv.protocol;
  * compiling, including the codec. That turns "forgot to serialize the new message" from a
  * runtime bug into a compile error.
  *
- * <p>Raft messages are plain one-way messages: a reply is just another message sent back
- * (the style etcd/raft uses). Raft tolerates loss, duplication and reordering by design,
- * so the Raft core needs no request/response futures. Client RPCs will add correlation ids
- * on top (Milestone 5/7).
+ * <p>Clients match replies to requests by {@code (clientId, sequence)}, which the reply echoes.
  */
-public sealed interface Message
-        permits RequestVote, RequestVoteReply,
-                AppendEntries, AppendEntriesReply,
-                InstallSnapshot, InstallSnapshotReply,
-                TimeoutNow {
-
-    /** Every Raft message carries the sender's current term (Figure 2, "Rules for Servers"). */
-    long term();
+public sealed interface Message permits RaftMessage, ClientRequest, ClientReply {
 
     /** The wire type of this message. Exhaustive switch: no default needed. */
     default MessageType type() {
@@ -33,6 +24,8 @@ public sealed interface Message
             case InstallSnapshot m -> MessageType.INSTALL_SNAPSHOT;
             case InstallSnapshotReply m -> MessageType.INSTALL_SNAPSHOT_REPLY;
             case TimeoutNow m -> MessageType.TIMEOUT_NOW;
+            case ClientRequest m -> MessageType.CLIENT_REQUEST;
+            case ClientReply m -> MessageType.CLIENT_REPLY;
         };
     }
 }

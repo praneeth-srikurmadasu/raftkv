@@ -8,4 +8,9 @@ public enum SystemClock implements Clock {
     public long nanos() {
         return System.nanoTime();
     }
+
+    @Override
+    public long wallMillis() {
+        return System.currentTimeMillis();
+    }
 }

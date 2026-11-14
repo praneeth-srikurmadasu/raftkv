@@ -13,7 +13,7 @@ import dev.raftkv.common.NodeId;
  * @param term     leader's term
  * @param leaderId the leader handing over
  */
-public record TimeoutNow(long term, NodeId leaderId) implements Message {
+public record TimeoutNow(long term, NodeId leaderId) implements RaftMessage {
 
     public TimeoutNow {
         nonNegative(term, "term");

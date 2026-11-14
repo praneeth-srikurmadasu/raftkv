@@ -20,7 +20,7 @@ import dev.raftkv.common.NodeId;
  * @param done              true if this is the last chunk
  */
 public record InstallSnapshot(long term, NodeId leaderId, long lastIncludedIndex, long lastIncludedTerm,
-                              long offset, Bytes data, boolean done) implements Message {
+                              long offset, Bytes data, boolean done) implements RaftMessage {
 
     public InstallSnapshot {
         nonNegative(term, "term");

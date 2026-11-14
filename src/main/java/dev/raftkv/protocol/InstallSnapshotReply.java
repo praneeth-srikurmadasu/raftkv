@@ -7,7 +7,7 @@ import static dev.raftkv.protocol.Checks.nonNegative;
  *
  * @param term currentTerm, for leader to update itself
  */
-public record InstallSnapshotReply(long term) implements Message {
+public record InstallSnapshotReply(long term) implements RaftMessage {
 
     public InstallSnapshotReply {
         nonNegative(term, "term");

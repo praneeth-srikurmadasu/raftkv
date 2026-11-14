@@ -81,6 +81,19 @@ This document grows with every milestone. It records **what** we built, **why** 
 | Leader durability | Append, replicate immediately, fsync in a scheduled flush; count own copy only after it | fsync before replicating | Overlaps the leader's fsync with the network round trip (thesis §10.2.1) and batches fsyncs (group commit). |
 | Windows | Directory fsync is a no-op | Fail | Windows can't open directories as channels; NTFS journals metadata. |
 
+### Key decisions (Milestone 5)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Message hierarchy | `Message` = `RaftMessage` (has a term) ∪ `ClientRequest` ∪ `ClientReply` | Give client messages a fake term | Raft's "higher term → step down" rule must never fire on client traffic; the type system now guarantees it. |
+| Exactly-once | Per-client cache of results by sequence + client-sent `ackedBelow` watermark (thesis §6.3, RIFL) | Last sequence per client | Supports many in-flight requests per client (async API); memory bounded by what's unacknowledged. |
+| Client identity | Random 128-bit UUID, no registration entry | Register sessions through the log | One less round trip; a lost session is detected by `ackedBelow > 1` on an unknown client. |
+| Session expiry | Leader stamps wall-clock time into each entry; state machine uses `max` of seen timestamps | Local clocks | Every replica must expire the same sessions at the same index, or replicas diverge. |
+| Reads | `GET` goes through the log | ReadIndex / leases | Simple and linearizable; faster read paths are Milestone 11. |
+| Bad input in apply | Becomes `INVALID_REQUEST` | Throw | A throw would crash every replica at the same entry, forever. |
+| Client retries | Same sequence number; exponential backoff with full jitter; overall deadline | Fixed retry delay | Jitter avoids synchronized retry storms after a leader change. |
+| Client threading | All state on one event loop; async API; blocking helpers for non-loop callers | Locks | Same model as the server; deterministic in simulation. |
+
 ### Known limitation (until Milestone 11)
 A node that misses heartbeats (briefly partitioned) can time out right after it reconnects; its higher term then makes the healthy leader step down through Fig. 2's "higher term → follower" rule. Safety is unaffected, but it costs an election. Pre-vote removes this. The chaos test lets the group settle for 2 s after healing before checking stability.
 
@@ -92,3 +105,5 @@ A node that misses heartbeats (briefly partitioned) can time out right after it 
 4. **Bug switches.** SPEC §9.6 describes `static final` flags enabled through a separate build profile. Instead, bugs are an `EnumSet` inside `RaftConfig` (`RaftConfig.defaults()` has none). This lets one test run compare buggy and correct code side by side with no special build, at the cost of one set lookup per guarded line. Only test code ever enables a bug.
 5. **Bug detection by targeted tests.** `COMMIT_INDEX_FROM_LAST_LOG_INDEX` is detected by a rule-level test, because this leader design never creates the situation where the bug does damage. `COMMIT_PREVIOUS_TERM_BY_COUNT` is detected by the scripted Figure 8 test, because random chaos reaches a Figure 8 shape too rarely to rely on (see docs/learning/03-log-replication.md §8).
 6. **Durable state machine.** The state machine is still rebuilt by replaying the log after a restart; persisting it is the job of snapshots (Milestone 8).
+7. **No session registration.** SPEC §4.2 allows registering sessions through the log; clients instead pick a random 128-bit id and the first request (with `ackedBelow == 1`) creates the session. Losing a session is still detected (`ackedBelow > 1` on an unknown client → `SESSION_EXPIRED`).
+8. **RaftLog is not AutoCloseable.** It has a plain `close()` so IDEs don't flag every in-memory or node-owned log as a resource leak.

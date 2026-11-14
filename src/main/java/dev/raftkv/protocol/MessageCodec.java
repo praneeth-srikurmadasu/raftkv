@@ -2,6 +2,7 @@ package dev.raftkv.protocol;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 import dev.raftkv.codec.BinaryReader;
 import dev.raftkv.codec.BinaryWriter;
@@ -81,6 +82,20 @@ public final class MessageCodec {
                 w.writeLong(m.term());
                 writeNodeId(w, m.leaderId());
             }
+            case ClientRequest m -> {
+                w.writeLong(m.clientId().getMostSignificantBits());
+                w.writeLong(m.clientId().getLeastSignificantBits());
+                w.writeLong(m.sequence());
+                w.writeLong(m.ackedBelow());
+                w.writeBytes(m.command());
+            }
+            case ClientReply m -> {
+                w.writeLong(m.sequence());
+                w.writeByte(m.status().code());
+                w.writeBoolean(m.leaderHint() != null);
+                w.writeInt(m.leaderHint() != null ? m.leaderHint().value() : 0);
+                w.writeBytes(m.result());
+            }
         }
         return w.toBytes();
     }
@@ -107,6 +122,9 @@ public final class MessageCodec {
                         r.readLong(), r.readBytes(), r.readBoolean());
                 case INSTALL_SNAPSHOT_REPLY -> new InstallSnapshotReply(r.readLong());
                 case TIMEOUT_NOW -> new TimeoutNow(r.readLong(), readNodeId(r));
+                case CLIENT_REQUEST -> new ClientRequest(new UUID(r.readLong(), r.readLong()), r.readLong(), r.readLong(),
+                        r.readBytes());
+                case CLIENT_REPLY -> decodeClientReply(r);
             };
         } catch (IllegalArgumentException e) {
             // A record constructor rejected the values: the bytes were well-formed but meaningless.
@@ -123,6 +141,14 @@ public final class MessageCodec {
 
     // Java evaluates constructor arguments left to right (JLS §15.12.4.2), which is what makes
     // the one-line decoders above read the fields in the order they were written.
+
+    private static ClientReply decodeClientReply(BinaryReader r) {
+        long sequence = r.readLong();
+        ClientStatus status = ClientStatus.fromCode(r.readByte());
+        boolean hasHint = r.readBoolean();
+        int hint = r.readInt();
+        return new ClientReply(sequence, status, hasHint ? new NodeId(hint) : null, r.readBytes());
+    }
 
     private static AppendEntries decodeAppendEntries(BinaryReader r) {
         long term = r.readLong();

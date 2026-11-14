@@ -34,6 +34,14 @@ public final class RandomMessages {
             case INSTALL_SNAPSHOT -> new InstallSnapshot(edgeLong(r), node(r), edgeLong(r), edgeLong(r), edgeLong(r), bytes(r, 512), r.nextBoolean());
             case INSTALL_SNAPSHOT_REPLY -> new InstallSnapshotReply(edgeLong(r));
             case TIMEOUT_NOW -> new TimeoutNow(edgeLong(r), node(r));
+            case CLIENT_REQUEST -> {
+                long seq = 1 + (edgeLong(r) % (Long.MAX_VALUE - 1));
+                long acked = 1 + (r.nextLong() & Long.MAX_VALUE) % seq;
+                yield new ClientRequest(new java.util.UUID(r.nextLong(), r.nextLong()), seq, acked, bytes(r, 256));
+            }
+            case CLIENT_REPLY -> new ClientReply(1 + (edgeLong(r) % (Long.MAX_VALUE - 1)),
+                    ClientStatus.values()[r.nextInt(ClientStatus.values().length)],
+                    r.nextBoolean() ? node(r) : null, bytes(r, 256));
         };
     }
 

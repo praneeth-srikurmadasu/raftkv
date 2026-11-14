@@ -152,9 +152,10 @@ class SimulatedDiskTest {
     @Test
     void handlesDieWithTheCrash() {
         SimulatedDisk disk = diskWith("x", 1);
-        DiskFile f = disk.open(FILE);
-        disk.crash(CrashMode.KEEP_ALL);
-        assertThatThrownBy(f::size).isInstanceOf(DiskException.class).hasMessageContaining("crashed");
+        try (DiskFile f = disk.open(FILE)) {
+            disk.crash(CrashMode.KEEP_ALL);
+            assertThatThrownBy(f::size).isInstanceOf(DiskException.class).hasMessageContaining("crashed");
+        }
     }
 
     @Test

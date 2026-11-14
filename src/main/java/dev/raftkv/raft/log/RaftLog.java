@@ -15,7 +15,7 @@ import java.util.List;
  *   <li>terms never decrease along the log.</li>
  * </ul>
  */
-public interface RaftLog extends AutoCloseable {
+public interface RaftLog {
 
     /** Index of the last entry, or 0 if the log is empty. */
     long lastIndex();
@@ -56,8 +56,12 @@ public interface RaftLog extends AutoCloseable {
      */
     void truncateSuffix(long fromIndex);
 
-    /** Releases files. Default: nothing to release. */
-    @Override
+    /**
+     * Releases files (persistent logs). Default: nothing to release.
+     *
+     * <p>Deliberately not {@link AutoCloseable}: most logs (in-memory ones, logs owned by a
+     * long-lived node) are not scoped to a block, and IDEs would flag every one as a leak.
+     */
     default void close() {
     }
 }

@@ -34,5 +34,10 @@ public enum Bug {
     // ---- Milestone 4: persistence
 
     /** Acknowledge entries (and count the leader's own copy) without fsyncing the log first. */
-    REPLY_BEFORE_FSYNC
+    REPLY_BEFORE_FSYNC,
+
+    // ---- Milestone 5: KV sessions
+
+    /** The KV state machine ignores cached results, so a retried request executes again. */
+    SESSION_DEDUP_DISABLED
 }

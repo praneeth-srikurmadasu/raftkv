@@ -13,7 +13,7 @@ import static dev.raftkv.protocol.Checks.nonNegative;
  * @param conflictTerm  on failure: term of the conflicting entry, or 0 if the follower's log is too short
  */
 public record AppendEntriesReply(long term, boolean success, long matchIndex,
-                                 long conflictIndex, long conflictTerm) implements Message {
+                                 long conflictIndex, long conflictTerm) implements RaftMessage {
 
     public AppendEntriesReply {
         nonNegative(term, "term");

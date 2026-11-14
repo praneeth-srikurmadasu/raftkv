@@ -24,7 +24,9 @@ public final class RealDisk implements Disk {
 
     private static final boolean WINDOWS = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).startsWith("windows");
 
+    /** The caller owns the returned file and must close it. */
     @Override
+    @SuppressWarnings("resource")
     public DiskFile open(Path path) {
         try {
             return new RealFile(FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE));

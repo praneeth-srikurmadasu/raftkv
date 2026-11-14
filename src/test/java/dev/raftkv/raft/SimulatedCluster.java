@@ -17,7 +17,12 @@ import java.nio.file.Path;
 import dev.raftkv.common.Bytes;
 import dev.raftkv.common.GroupId;
 import dev.raftkv.common.NodeId;
+import dev.raftkv.client.ClientConfig;
+import dev.raftkv.client.RaftKVClient;
 import dev.raftkv.io.sim.SimulatedDisk;
+import dev.raftkv.kv.KVServer;
+import dev.raftkv.kv.KVStateMachine;
+import dev.raftkv.protocol.ClientRequest;
 import dev.raftkv.raft.log.LogEntry;
 import dev.raftkv.raft.log.SegmentedFileLog;
 import dev.raftkv.raft.storage.FileMetaStore;
@@ -73,6 +78,12 @@ final class SimulatedCluster {
     private final Map<NodeId, RecordingStateMachine> stateMachines = new TreeMap<>();
     private final Map<NodeId, Transport> transports = new TreeMap<>();
     private final Map<NodeId, RaftNode> running = new TreeMap<>();
+    /** KV mode: each node runs a {@link KVStateMachine} and a {@link KVServer}; clients can join. */
+    private boolean kvMode;
+    private Duration kvSessionTimeout = Duration.ofHours(1);
+    private final Map<NodeId, KVServer> kvServers = new TreeMap<>();
+    private final List<RaftKVClient> clients = new ArrayList<>();
+
     /** Optional hook that sees every message as it is delivered (tests count specific messages). */
     java.util.function.Consumer<dev.raftkv.transport.Envelope> deliveryObserver = e -> { };
 
@@ -86,6 +97,18 @@ final class SimulatedCluster {
      */
     SimulatedCluster(long seed, int size, RaftConfig config, Map<NodeId, List<LogEntry>> initialLogs, long initialTerm) {
         this(seed, size, config, initialLogs, initialTerm, Storage.MEMORY);
+    }
+
+    /** A cluster running the KV store, ready for {@link #newClient}. */
+    static SimulatedCluster kv(long seed, int size, RaftConfig config, Storage storage) {
+        SimulatedCluster c = new SimulatedCluster(seed, size, config, Map.of(), 0, storage);
+        c.kvMode = true;
+        return c;
+    }
+
+    /** Session timeout for the KV state machines (set before starting nodes). */
+    void setKvSessionTimeout(Duration timeout) {
+        this.kvSessionTimeout = timeout;
     }
 
     /** A cluster whose nodes keep their state on simulated disks that lose unsynced data on crash. */
@@ -123,7 +146,14 @@ final class SimulatedCluster {
                 RaftNode node = running.get(id);
                 if (node != null) {
                     deliveryObserver.accept(envelope);
-                    node.handle(envelope);
+                    if (envelope.message() instanceof ClientRequest) {
+                        KVServer server = kvServers.get(id);
+                        if (server != null) {
+                            server.handle(envelope);
+                        }
+                    } else {
+                        node.handle(envelope);
+                    }
                 }
             }));
         }
@@ -149,7 +179,9 @@ final class SimulatedCluster {
     }
 
     private void start(NodeId id) {
-        RecordingStateMachine sm = new RecordingStateMachine(id, globallyApplied);
+        RecordingStateMachine sm = kvMode
+                ? new RecordingStateMachine(id, globallyApplied, new KVStateMachine(kvSessionTimeout, config.bugs()))
+                : new RecordingStateMachine(id, globallyApplied);
         stateMachines.put(id, sm);
         RaftNode node = RaftNode.builder()
                 .self(id)
@@ -166,7 +198,38 @@ final class SimulatedCluster {
                 .tracer(sim)
                 .build();
         running.put(id, node);
+        if (kvMode) {
+            kvServers.put(id, new KVServer(node, transports.get(id), sim.clock()));
+        }
         node.start();
+    }
+
+    /** The KV store of a node's current run. */
+    KVStateMachine kvStore(NodeId id) {
+        return (KVStateMachine) stateMachines.get(id).delegate();
+    }
+
+    /**
+     * Adds a client to the network (as node 1000 + n) that knows only {@code knownServers}
+     * (all servers if empty). Its event loop is the simulation.
+     */
+    RaftKVClient newClient(ClientConfig clientConfig, NodeId... knownServers) {
+        NodeId clientNode = NodeId.of(1000 + clients.size());
+        RaftKVClient[] holder = new RaftKVClient[1];
+        Transport t = net.register(clientNode, envelope -> holder[0].onMessage(envelope));
+        List<NodeId> seeds = knownServers.length == 0 ? ids : List.of(knownServers);
+        holder[0] = new RaftKVClient(t, sim, sim.clock(), sim.forkRandom(), seeds, GROUP, clientConfig);
+        clients.add(holder[0]);
+        return holder[0];
+    }
+
+    /** Runs the simulation until {@code future} completes (or fails after {@code max}). */
+    <T> T await(CompletableFuture<T> future, Duration max) {
+        sim.runUntil(future::isDone, max);
+        if (!future.isDone()) {
+            throw new AssertionError("operation did not complete within " + max + " (seed " + sim.seed() + ")");
+        }
+        return future.join();
     }
 
     /** (Re)opens a node's meta store and log from its simulated disk, running recovery. */
@@ -187,6 +250,7 @@ final class SimulatedCluster {
             throw new IllegalStateException(id + " is not running");
         }
         node.stop();
+        kvServers.remove(id);
         net.setNodeUp(id, false);
         if (storage == Storage.DISK) {
             disks.get(id).crash(SimulatedDisk.CrashMode.RANDOM);
@@ -248,6 +312,31 @@ final class SimulatedCluster {
                 .max(java.util.Comparator.comparingLong(RaftNode::currentTerm))
                 .orElseThrow(() -> new IllegalStateException("no leader to propose to"));
         return leader.propose(Bytes.ofUtf8(command));
+    }
+
+    /**
+     * Runs until every running node has applied exactly the same prefix of the log, and that
+     * prefix is everything the current leader has committed. Use this before comparing replica
+     * states: comparing at different log positions is meaningless (a late duplicate entry may
+     * still be on its way to one of them).
+     */
+    void awaitIdenticalApplied(Duration max) {
+        boolean ok = sim.runUntil(() -> {
+            long applied = -1;
+            for (RaftNode n : runningNodes()) {
+                if (applied < 0) {
+                    applied = n.lastApplied();
+                } else if (n.lastApplied() != applied) {
+                    return false;
+                }
+            }
+            long at = applied;
+            return leaders().stream().anyMatch(l -> l.commitIndex() == at);
+        }, max);
+        if (!ok) {
+            throw new AssertionError("replicas did not converge to the same applied index within " + max
+                    + " (seed " + sim.seed() + "): " + runningNodes());
+        }
     }
 
     /** Runs until every running node has applied at least up to {@code index}. */

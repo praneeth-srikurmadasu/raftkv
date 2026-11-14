@@ -42,7 +42,10 @@ class MessageCodecTest {
                 new AppendEntriesReply(3, false, 0, 4, 2),
                 new InstallSnapshot(9, N1, 1000, 8, 65536, Bytes.copyOf(new byte[100]), true),
                 new InstallSnapshotReply(9),
-                new TimeoutNow(4, N1));
+                new TimeoutNow(4, N1),
+                new ClientRequest(new java.util.UUID(1, 2), 7, 5, Bytes.ofUtf8("PUT a b")),
+                new ClientReply(7, ClientStatus.OK, null, Bytes.ofUtf8("result")),
+                new ClientReply(8, ClientStatus.NOT_LEADER, N1, Bytes.EMPTY));
     }
 
     @Test
@@ -161,6 +164,12 @@ class MessageCodecTest {
         assertThat(MessageType.INSTALL_SNAPSHOT.code()).isEqualTo((short) 5);
         assertThat(MessageType.INSTALL_SNAPSHOT_REPLY.code()).isEqualTo((short) 6);
         assertThat(MessageType.TIMEOUT_NOW.code()).isEqualTo((short) 7);
+        assertThat(MessageType.CLIENT_REQUEST.code()).isEqualTo((short) 100);
+        assertThat(MessageType.CLIENT_REPLY.code()).isEqualTo((short) 101);
+        assertThat(ClientStatus.OK.code()).isEqualTo((byte) 0);
+        assertThat(ClientStatus.NOT_LEADER.code()).isEqualTo((byte) 1);
+        assertThat(ClientStatus.SESSION_EXPIRED.code()).isEqualTo((byte) 2);
+        assertThat(ClientStatus.INVALID_REQUEST.code()).isEqualTo((byte) 3);
         assertThat(EntryType.COMMAND.code()).isEqualTo((byte) 1);
         assertThat(EntryType.NOOP.code()).isEqualTo((byte) 2);
         assertThat(EntryType.CONFIGURATION.code()).isEqualTo((byte) 3);

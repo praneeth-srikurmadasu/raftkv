@@ -19,7 +19,7 @@ import dev.raftkv.raft.log.LogEntry;
  * @param leaderCommit leader's commitIndex
  */
 public record AppendEntries(long term, NodeId leaderId, long prevLogIndex, long prevLogTerm,
-                            List<LogEntry> entries, long leaderCommit) implements Message {
+                            List<LogEntry> entries, long leaderCommit) implements RaftMessage {
 
     public AppendEntries {
         nonNegative(term, "term");

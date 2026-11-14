@@ -4,7 +4,7 @@ A sharded, fault-tolerant distributed key-value store built on the Raft consensu
 
 [![CI](https://github.com/praneeth-srikurmadasu/raftkv/actions/workflows/ci.yml/badge.svg)](https://github.com/praneeth-srikurmadasu/raftkv/actions/workflows/ci.yml)
 
-> **Status:** Milestone 4 (persistence) complete. The full plan is in [SPEC.md](SPEC.md).
+> **Status:** Milestone 5 (KV store, sessions, client) complete. The full plan is in [SPEC.md](SPEC.md).
 
 ## Progress
 
@@ -15,8 +15,8 @@ A sharded, fault-tolerant distributed key-value store built on the Raft consensu
 | 2 | Leader election | ✅ |
 | 3 | Log replication | ✅ |
 | 4 | Persistence (MetaStore, segmented log, simulated disk) | ✅ |
-| 5 | KV state machine, sessions, client library | ⏳ next |
-| 6 | Linearizability checker + chaos suite | |
+| 5 | KV state machine, sessions, client library | ✅ |
+| 6 | Linearizability checker + chaos suite | ⏳ next |
 | 7 | Real TCP transport, CLI, real cluster | |
 | 8 | Snapshots and log compaction | |
 | 9 | Multi-Raft + ShardController | |
@@ -24,6 +24,16 @@ A sharded, fault-tolerant distributed key-value store built on the Raft consensu
 | 11 | ReadIndex, lease reads, pre-vote, performance | |
 | 12 | Membership changes | |
 | 13 | Metrics, dashboard, benchmarks, polish | |
+
+## Using the client (Java)
+
+```java
+// The real network transport arrives in Milestone 7; today the client runs in the simulator.
+RaftKVClient client = cluster.newClient(ClientConfig.defaults());
+client.putAsync(Bytes.ofUtf8("city"), Bytes.ofUtf8("Hyderabad"));   // -> previous value
+client.getAsync(Bytes.ofUtf8("city"));                                // -> Optional[Hyderabad]
+client.casAsync(key, Optional.of(expected), newValue);                // -> CasResult(success, current)
+```
 
 ## Build and test
 
@@ -50,10 +60,12 @@ raftkv/
 │   ├── common/              Bytes, NodeId, GroupId, Clock, Scheduler, Hashing, EventLoopScheduler
 │   ├── codec/               BinaryWriter/Reader, Frame, FrameCodec, FrameDecoder
 │   ├── io/                  Disk, RealDisk; sim/SimulatedDisk (loses unsynced data on crash)
-│   ├── protocol/            sealed Message, the 7 Raft messages, MessageCodec
+│   ├── protocol/            sealed Message (RaftMessage | ClientRequest | ClientReply), MessageCodec
 │   ├── raft/                RaftNode (election + replication), LeaderState, StateMachine, RaftConfig, Bug
 │   │   ├── log/             RaftLog, InMemoryLog, SegmentedFileLog, LogEntry, EntryType
 │   │   └── storage/         PersistentState, MetaStore, FileMetaStore, InMemoryMetaStore
+│   ├── kv/                  KVStateMachine, SessionTable (exactly-once), KVServer, KVCodec
+│   ├── client/              RaftKVClient (leader discovery, retries, async)
 │   ├── sim/                 Simulation (virtual time, seeded event order, trace hash)
 │   └── transport/           Transport interface; sim/SimulatedNetwork
 ├── src/test/java/dev/raftkv/    tests (same package layout)
@@ -74,6 +86,7 @@ Every simulation test prints its seed when it fails. Re-run exactly that executi
 .\mvnw.cmd test "-Dtest=ElectionChaosTest" "-Draftkv.seeds=5000"   # more chaos seeds
 .\mvnw.cmd test "-Dtest=ReplicationChaosTest" "-Draftkv.seeds=10000"
 .\mvnw.cmd test "-Dtest=PersistenceChaosTest" "-Draftkv.seeds=5000"
+.\mvnw.cmd test "-Dtest=KVChaosTest" "-Draftkv.seeds=3000"
 ```
 
 ## License

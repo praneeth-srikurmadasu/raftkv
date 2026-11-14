@@ -26,6 +26,7 @@ import dev.raftkv.protocol.AppendEntriesReply;
 import dev.raftkv.protocol.InstallSnapshot;
 import dev.raftkv.protocol.InstallSnapshotReply;
 import dev.raftkv.protocol.Message;
+import dev.raftkv.protocol.RaftMessage;
 import dev.raftkv.protocol.RequestVote;
 import dev.raftkv.protocol.RequestVoteReply;
 import dev.raftkv.protocol.TimeoutNow;
@@ -217,7 +218,9 @@ public final class RaftNode {
             trace("ignored message from non-member " + from + " for " + envelope.group());
             return;
         }
-        Message message = envelope.message();
+        if (!(envelope.message() instanceof RaftMessage message)) {
+            return; // client traffic is handled by the server layer above Raft (KVServer)
+        }
 
         // Thesis §4.2.3 leader stickiness: if we believe a leader is alive (we are it, or we
         // heard from it within the minimum election timeout), a RequestVote is a disruption.

@@ -9,7 +9,7 @@ import static dev.raftkv.protocol.Checks.nonNegative;
  * @param voteGranted true means the candidate received the vote
  * @param preVote     echoes the request, so a late pre-vote reply is never counted as a real vote
  */
-public record RequestVoteReply(long term, boolean voteGranted, boolean preVote) implements Message {
+public record RequestVoteReply(long term, boolean voteGranted, boolean preVote) implements RaftMessage {
 
     public RequestVoteReply {
         nonNegative(term, "term");

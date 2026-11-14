@@ -78,10 +78,6 @@ public final class SegmentedFileLog implements RaftLog {
             this.path = path;
             this.file = file;
         }
-
-        long lastIndex() {
-            return firstIndex + offsets.size() - 1;
-        }
     }
 
     private SegmentedFileLog(Disk disk, Path dir, long segmentBytes) {
@@ -130,7 +126,7 @@ public final class SegmentedFileLog implements RaftLog {
                         + (lastIndex + 1) + " (gap or overlap between segments)");
             }
             Path path = dir.resolve(segmentName(first));
-            Segment seg = new Segment(first, path, disk.open(path));
+            Segment seg = openSegment(first, path);
             segments.add(seg);
             long fileSize = seg.file.size();
             long offset = 0;
@@ -372,10 +368,16 @@ public final class SegmentedFileLog implements RaftLog {
 
     private Segment createSegment(long firstIndex) {
         Path path = dir.resolve(segmentName(firstIndex));
-        Segment seg = new Segment(firstIndex, path, disk.open(path));
+        Segment seg = openSegment(firstIndex, path);
         segments.add(seg);
         directoryDirty = true;
         return seg;
+    }
+
+    /** The returned segment owns the open file; {@link #close()} (or truncation) closes it. */
+    @SuppressWarnings("resource")
+    private Segment openSegment(long firstIndex, Path path) {
+        return new Segment(firstIndex, path, disk.open(path));
     }
 
     private Segment segmentFor(long index) {

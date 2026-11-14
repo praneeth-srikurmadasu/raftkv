@@ -84,7 +84,7 @@ class SimulatedNetworkTest {
         }
         f.sim.runFor(Duration.ofSeconds(1));
         List<Long> received = new ArrayList<>();
-        f.inbox.get(B).forEach(e -> received.add(e.message().term()));
+        f.inbox.get(B).forEach(e -> received.add(((dev.raftkv.protocol.RaftMessage) e.message()).term()));
         assertThat(received).hasSize(100);
         assertThat(received).isNotEqualTo(received.stream().sorted().toList()); // some arrived out of order
         f.arrivalMillis.forEach(t -> assertThat(t).isBetween(1L, 50L));
