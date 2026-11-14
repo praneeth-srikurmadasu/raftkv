@@ -18,5 +18,16 @@ public enum Bug {
     /** Persist the term but forget votedFor, so a restarted node can vote again in the same term. */
     VOTEDFOR_NOT_PERSISTED,
     /** A leader ignores messages with a higher term instead of stepping down (Fig.2 "All Servers"). */
-    LEADER_IGNORES_HIGHER_TERM
+    LEADER_IGNORES_HIGHER_TERM,
+
+    // ---- Milestone 3: replication
+
+    /** Commit an entry as soon as a majority stores it, even from an earlier term (the Figure 8 bug, §5.4.2). */
+    COMMIT_PREVIOUS_TERM_BY_COUNT,
+    /** Follower sets commitIndex = min(leaderCommit, last log index) instead of the last <em>new</em> entry (Fig.2 rule 5). */
+    COMMIT_INDEX_FROM_LAST_LOG_INDEX,
+    /** Follower always truncates after prevLogIndex, even when entries match, so a stale message deletes newer entries. */
+    TRUNCATE_ON_STALE_APPEND,
+    /** A new leader does not append a no-op, so entries from earlier terms never commit without new traffic (§8). */
+    NO_NOOP_ON_ELECTION
 }

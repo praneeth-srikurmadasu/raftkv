@@ -1,15 +1,20 @@
 package dev.raftkv.raft;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
 
+import dev.raftkv.common.Bytes;
 import dev.raftkv.common.Cancellable;
 import dev.raftkv.common.Clock;
 import dev.raftkv.common.GroupId;
@@ -24,6 +29,8 @@ import dev.raftkv.protocol.Message;
 import dev.raftkv.protocol.RequestVote;
 import dev.raftkv.protocol.RequestVoteReply;
 import dev.raftkv.protocol.TimeoutNow;
+import dev.raftkv.raft.log.EntryType;
+import dev.raftkv.raft.log.LogEntry;
 import dev.raftkv.raft.log.RaftLog;
 import dev.raftkv.raft.storage.MetaStore;
 import dev.raftkv.raft.storage.PersistentState;
@@ -33,10 +40,10 @@ import dev.raftkv.transport.Transport;
 /**
  * One server's replica of one Raft group.
  *
- * <p><b>Milestone 2 scope: leader election.</b> Terms, RequestVote, randomized election
- * timeouts, heartbeats, and leader stickiness. Log replication (AppendEntries with entries,
- * commit index, applying) arrives in Milestone 3; the heartbeat handler already performs the
- * Figure 2 consistency check so that step is a small extension.
+ * <p><b>Scope so far:</b> leader election (Milestone 2) and log replication (Milestone 3):
+ * AppendEntries with the full Figure 2 receiver rules, fast backtracking, the commit rule that
+ * only counts replicas for entries of the current term (§5.4.2, Figure 8), a no-op entry on
+ * election, and applying committed entries to the {@link StateMachine} in order.
  *
  * <p><b>Threading.</b> Every public method must be called on this node's {@link Scheduler}
  * (its event loop). The node never blocks and never creates threads, which is what makes it
@@ -61,6 +68,7 @@ public final class RaftNode {
     private final Transport transport;
     private final RaftLog log;
     private final MetaStore metaStore;
+    private final StateMachine stateMachine;
     private final Tracer tracer;
 
     // ---- Persistent state on all servers (Figure 2); the log is the third piece.
@@ -71,6 +79,17 @@ public final class RaftNode {
     private Role role = Role.FOLLOWER;
     private NodeId leaderId;
     private boolean running;
+    /** Fig.2: index of highest log entry known to be committed (initialized to 0, increases monotonically). */
+    private long commitIndex;
+    /** Fig.2: index of highest log entry applied to state machine (initialized to 0, increases monotonically). */
+    private long lastApplied;
+
+    // ---- Leader state (Fig.2 "volatile state on leaders"); null unless leader.
+    private LeaderState leaderState;
+    /** Proposals waiting for their entry to be applied: index -> who is waiting. */
+    private final Map<Long, Pending> pending = new TreeMap<>();
+
+    private record Pending(long term, CompletableFuture<CommitResult> future) {}
 
     // ---- Candidate state: who answered, who granted.
     private final Set<NodeId> votesGranted = new TreeSet<>();
@@ -99,6 +118,7 @@ public final class RaftNode {
         this.transport = Objects.requireNonNull(b.transport, "transport");
         this.log = Objects.requireNonNull(b.log, "log");
         this.metaStore = Objects.requireNonNull(b.metaStore, "metaStore");
+        this.stateMachine = b.stateMachine == null ? (index, command) -> Bytes.EMPTY : b.stateMachine;
         this.tracer = b.tracer == null ? Tracer.NOOP : b.tracer;
         if (!voters.contains(self)) {
             throw new IllegalArgumentException(self + " must be one of the voters " + voters);
@@ -130,6 +150,8 @@ public final class RaftNode {
         }
         running = true;
         role = Role.FOLLOWER;
+        commitIndex = 0;   // volatile: relearned from the leader
+        lastApplied = 0;   // volatile: the state machine is rebuilt by re-applying the log
         trace("started (votedFor=" + votedFor + ", last log " + log.lastIndex() + "@t" + log.lastTerm() + ")");
         resetElectionTimer();
     }
@@ -140,7 +162,36 @@ public final class RaftNode {
         cancel(electionTimer);
         cancel(heartbeatTimer);
         cancel(voteRetryTimer);
+        failPending();
         trace("stopped");
+    }
+
+    // =====================================================================================
+    // Client proposals
+    // =====================================================================================
+
+    /**
+     * Asks the group to replicate {@code command}. Only the leader accepts: it appends the entry
+     * to its own log and starts replicating it at once.
+     *
+     * <p>The future completes when the entry is <b>committed and applied</b>, with the state
+     * machine's result. It fails with {@link NotLeaderException} if this node is not the leader,
+     * or stops being leader before the entry commits.
+     */
+    public CompletableFuture<CommitResult> propose(Bytes command) {
+        Objects.requireNonNull(command, "command");
+        if (!running || role != Role.LEADER) {
+            return CompletableFuture.failedFuture(new NotLeaderException(running ? leaderId : null));
+        }
+        // Fig.2 Leaders: "If command received from client: append entry to local log, respond
+        // after entry applied to state machine (§5.3)".
+        LogEntry entry = new LogEntry(log.lastIndex() + 1, currentTerm, EntryType.COMMAND, command);
+        log.append(List.of(entry));
+        CompletableFuture<CommitResult> future = new CompletableFuture<>();
+        pending.put(entry.index(), new Pending(entry.term(), future));
+        advanceCommitIndex(); // a single-node group commits immediately
+        replicateToAll();
+        return future;
     }
 
     // =====================================================================================
@@ -288,16 +339,213 @@ public final class RaftNode {
         // Fig.2 Followers: hearing from the current leader restarts the election timer.
         resetElectionTimer();
 
+        long prevIndex = ae.prevLogIndex();
         // Fig.2 AppendEntries rule 2: "Reply false if log doesn't contain an entry at
-        // prevLogIndex whose term matches prevLogTerm (§5.3)". Appending entries (rules 3-5)
-        // is Milestone 3.
-        boolean matches = log.contains(ae.prevLogIndex()) && log.termAt(ae.prevLogIndex()) == ae.prevLogTerm();
-        send(from, new AppendEntriesReply(currentTerm, matches, matches ? ae.prevLogIndex() : 0, 0, 0));
+        // prevLogIndex whose term matches prevLogTerm (§5.3)".
+        if (!log.contains(prevIndex)) {
+            // Fast backtracking (§5.3): our log is too short; retry from just past our end.
+            send(from, new AppendEntriesReply(currentTerm, false, 0, log.lastIndex() + 1, 0));
+            return;
+        }
+        long termAtPrev = log.termAt(prevIndex);
+        if (termAtPrev != ae.prevLogTerm()) {
+            // Fast backtracking: report the conflicting term and the first index we hold for it,
+            // so the leader can skip the whole term in one round trip.
+            send(from, new AppendEntriesReply(currentTerm, false, 0, firstIndexOfTerm(termAtPrev, prevIndex), termAtPrev));
+            return;
+        }
+
+        appendNewEntries(ae);
+
+        long lastNewIndex = prevIndex + ae.entries().size();
+        // Fig.2 AppendEntries rule 5: "If leaderCommit > commitIndex, set commitIndex =
+        // min(leaderCommit, index of last new entry)". NOT the last index of our log: entries
+        // beyond lastNewIndex were not checked against the leader and may be stale.
+        long bound = config.has(Bug.COMMIT_INDEX_FROM_LAST_LOG_INDEX) ? log.lastIndex() : lastNewIndex;
+        if (ae.leaderCommit() > commitIndex) {
+            long newCommit = Math.min(ae.leaderCommit(), bound);
+            if (newCommit > commitIndex) {
+                commitIndex = newCommit;
+                applyCommitted();
+            }
+        }
+        send(from, new AppendEntriesReply(currentTerm, true, lastNewIndex, 0, 0));
     }
 
+    /** Fig.2 AppendEntries rules 3 and 4. */
+    private void appendNewEntries(AppendEntries ae) {
+        List<LogEntry> entries = ae.entries();
+        if (config.has(Bug.TRUNCATE_ON_STALE_APPEND)) {
+            if (log.lastIndex() > ae.prevLogIndex()) {
+                log.truncateSuffix(ae.prevLogIndex() + 1);
+            }
+            log.append(entries);
+            return;
+        }
+        for (int i = 0; i < entries.size(); i++) {
+            LogEntry e = entries.get(i);
+            if (log.contains(e.index())) {
+                if (log.termAt(e.index()) == e.term()) {
+                    continue; // already have it. Never truncate on a match: this message may be stale.
+                }
+                // Rule 3: "If an existing entry conflicts with a new one (same index but different
+                // terms), delete the existing entry and all that follow it (§5.3)".
+                if (e.index() <= commitIndex) {
+                    throw new IllegalStateException(self + " asked to overwrite committed entry " + e.index());
+                }
+                trace("truncating log from " + e.index() + " (had t" + log.termAt(e.index()) + ", leader has t" + e.term() + ")");
+                log.truncateSuffix(e.index());
+            }
+            // Rule 4: "Append any new entries not already in the log".
+            log.append(entries.subList(i, entries.size()));
+            return;
+        }
+    }
+
+    /** Smallest index of the run of {@code term} entries that ends at or before {@code fromIndex}. */
+    private long firstIndexOfTerm(long term, long fromIndex) {
+        long i = fromIndex;
+        while (i > 1 && log.termAt(i - 1) == term) {
+            i--;
+        }
+        return i;
+    }
+
+    // ---------------------------------------------------------------- AppendEntries (leader side)
+
     private void onAppendEntriesReply(NodeId from, AppendEntriesReply reply) {
-        // Milestone 3 tracks replication progress here. For elections, only the term matters,
-        // and the generic higher-term rule in handle() has already applied it.
+        if (role != Role.LEADER || reply.term() != currentTerm) {
+            return; // stale reply (a higher term has already been handled in handle())
+        }
+        if (reply.success()) {
+            if (reply.matchIndex() > log.lastIndex()) {
+                throw new IllegalStateException(from + " claims to match index " + reply.matchIndex()
+                        + " beyond our last index " + log.lastIndex());
+            }
+            long matchBefore = leaderState.matchIndex(from);
+            leaderState.recordMatch(from, reply.matchIndex());
+            advanceCommitIndex();
+            // Flow control: only a reply that made PROGRESS keeps the entries flowing. Replies to
+            // older, overlapping or duplicated messages don't trigger sends; otherwise every
+            // duplicate would start another never-ending chain of messages (SPEC §3.5).
+            if (reply.matchIndex() > matchBefore && leaderState.nextIndex(from) <= log.lastIndex()) {
+                replicateTo(from);
+            }
+            return;
+        }
+        // Rejected: back up nextIndex using the follower's hints (§5.3 optimization).
+        long next;
+        if (reply.conflictTerm() != 0) {
+            long lastOfTerm = lastIndexOfTerm(reply.conflictTerm());
+            next = lastOfTerm > 0 ? lastOfTerm + 1 : reply.conflictIndex();
+        } else {
+            next = reply.conflictIndex();
+        }
+        // Never move forward on a rejection (it may be stale), never below what is known to match.
+        long current = leaderState.nextIndex(from);
+        next = Math.min(next, current);
+        next = Math.max(next, leaderState.matchIndex(from) + 1);
+        if (next < current) {
+            leaderState.setNextIndex(from, next);
+            replicateTo(from); // retry at once from the better position
+        }
+        // A rejection that teaches us nothing new (stale or duplicated) sends nothing; the next
+        // heartbeat retries anyway.
+    }
+
+    /** Last index in our log whose term is {@code term}, or 0 if we have none. */
+    private long lastIndexOfTerm(long term) {
+        for (long i = log.lastIndex(); i >= 1; i--) {
+            long t = log.termAt(i);
+            if (t == term) {
+                return i;
+            }
+            if (t < term) {
+                return 0; // terms only decrease going backwards
+            }
+        }
+        return 0;
+    }
+
+    private void replicateToAll() {
+        for (NodeId peer : voters) {
+            if (!peer.equals(self)) {
+                replicateTo(peer);
+            }
+        }
+    }
+
+    /**
+     * Sends the next batch of entries (possibly none: a heartbeat) to {@code peer}, starting at
+     * its nextIndex. Messages may overlap or arrive twice; followers handle that idempotently.
+     */
+    private void replicateTo(NodeId peer) {
+        long next = leaderState.nextIndex(peer);
+        long prevIndex = next - 1;
+        List<LogEntry> entries = next <= log.lastIndex()
+                ? log.entriesFrom(next, config.maxEntriesPerAppend())
+                : List.of();
+        send(peer, new AppendEntries(currentTerm, self, prevIndex, log.termAt(prevIndex), entries, commitIndex));
+    }
+
+    /**
+     * Fig.2 Leaders: "If there exists an N such that N > commitIndex, a majority of
+     * matchIndex[i] >= N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4)".
+     *
+     * <p>The term condition is the fix for Figure 8: an entry from an earlier term may be stored
+     * on a majority and still be overwritten by a future leader, so counting replicas is only
+     * safe for entries of the leader's own term. Earlier entries then commit indirectly.
+     */
+    private void advanceCommitIndex() {
+        List<Long> matches = new ArrayList<>();
+        matches.add(log.lastIndex()); // the leader's own log
+        for (long m : leaderState.matchIndexes()) {
+            matches.add(m);
+        }
+        matches.sort(Collections.reverseOrder());
+        long n = matches.get(voters.size() / 2); // highest index stored on a majority
+        if (n <= commitIndex) {
+            return;
+        }
+        if (log.termAt(n) != currentTerm && !config.has(Bug.COMMIT_PREVIOUS_TERM_BY_COUNT)) {
+            return; // stored on a majority, but not safe to commit by counting (Figure 8)
+        }
+        commitIndex = n;
+        applyCommitted();
+    }
+
+    /** Fig.2 All Servers: "If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine". */
+    private void applyCommitted() {
+        if (lastApplied < commitIndex) {
+            trace("commit " + commitIndex);
+        }
+        while (lastApplied < commitIndex) {
+            lastApplied++;
+            LogEntry entry = log.entryAt(lastApplied);
+            Bytes result = entry.type() == EntryType.COMMAND
+                    ? stateMachine.apply(entry.index(), entry.data())
+                    : Bytes.EMPTY;
+            Pending p = pending.remove(entry.index());
+            if (p != null) {
+                if (p.term() == entry.term()) {
+                    p.future().complete(new CommitResult(entry.index(), entry.term(), result));
+                } else {
+                    // A different leader's entry ended up at this index: ours was lost (SPEC §3.6).
+                    p.future().completeExceptionally(new NotLeaderException(leaderId));
+                }
+            }
+        }
+    }
+
+    private void failPending() {
+        if (pending.isEmpty()) {
+            return;
+        }
+        List<Pending> waiting = new ArrayList<>(pending.values());
+        pending.clear();
+        for (Pending p : waiting) {
+            p.future().completeExceptionally(new NotLeaderException(leaderId));
+        }
     }
 
     // =====================================================================================
@@ -367,9 +615,18 @@ public final class RaftNode {
         cancel(electionTimer);
         cancel(voteRetryTimer);
         trace("became leader with votes from " + votesGranted);
+        // Fig.2: nextIndex starts at leader last log index + 1, matchIndex at 0.
+        List<NodeId> peers = voters.stream().filter(p -> !p.equals(self)).toList();
+        leaderState = new LeaderState(peers, log.lastIndex());
+        // §8: "each leader commit a blank no-op entry into the log at the start of its term".
+        // Entries from earlier terms can only commit indirectly, through an entry of the
+        // current term (Figure 8), so without this they could wait forever for a client write.
+        if (!config.has(Bug.NO_NOOP_ON_ELECTION)) {
+            log.append(List.of(LogEntry.noop(log.lastIndex() + 1, currentTerm)));
+        }
+        advanceCommitIndex(); // a single-node group commits the no-op at once
         // Fig.2 Leaders: "Upon election: send initial empty AppendEntries RPCs (heartbeat) to
         // each server; repeat during idle periods to prevent election timeouts (§5.2)".
-        // (The no-op entry of §5.4.2/§8 is appended here in Milestone 3.)
         sendHeartbeats();
     }
 
@@ -377,12 +634,7 @@ public final class RaftNode {
         if (!running || role != Role.LEADER) {
             return;
         }
-        AppendEntries heartbeat = new AppendEntries(currentTerm, self, log.lastIndex(), log.lastTerm(), List.of(), 0);
-        for (NodeId peer : voters) {
-            if (!peer.equals(self)) {
-                send(peer, heartbeat);
-            }
-        }
+        replicateToAll(); // carries entries to followers that are behind; empty heartbeat otherwise
         cancel(heartbeatTimer);
         heartbeatTimer = scheduler.schedule(config.heartbeatInterval(), this::sendHeartbeats);
     }
@@ -404,6 +656,8 @@ public final class RaftNode {
     private void becomeFollower(String why) {
         Role previous = role;
         role = Role.FOLLOWER;
+        leaderState = null;
+        failPending();
         cancel(heartbeatTimer);
         cancel(voteRetryTimer);
         votesGranted.clear();
@@ -496,13 +750,32 @@ public final class RaftNode {
         return electionsStarted;
     }
 
+    public long commitIndex() {
+        return commitIndex;
+    }
+
+    public long lastApplied() {
+        return lastApplied;
+    }
+
+    /** The leader's matchIndex for {@code peer}; empty unless this node is leader. */
+    public Optional<Long> matchIndexOf(NodeId peer) {
+        return leaderState == null || peer.equals(self) ? Optional.empty() : Optional.of(leaderState.matchIndex(peer));
+    }
+
+    /** Number of proposals still waiting to be applied (tests and metrics). */
+    public int pendingProposals() {
+        return pending.size();
+    }
+
     public RaftLog log() {
         return log;
     }
 
     @Override
     public String toString() {
-        return self + "(" + role + ", t" + currentTerm + ", leader=" + leaderId + ")";
+        return self + "(" + role + ", t" + currentTerm + ", leader=" + leaderId
+                + ", last=" + log.lastIndex() + ", commit=" + commitIndex + ")";
     }
 
     // =====================================================================================
@@ -521,6 +794,7 @@ public final class RaftNode {
         private Transport transport;
         private RaftLog log;
         private MetaStore metaStore;
+        private StateMachine stateMachine;
         private Tracer tracer;
 
         private Builder() {
@@ -536,6 +810,7 @@ public final class RaftNode {
         public Builder transport(Transport v) { this.transport = v; return this; }
         public Builder log(RaftLog v) { this.log = v; return this; }
         public Builder metaStore(MetaStore v) { this.metaStore = v; return this; }
+        public Builder stateMachine(StateMachine v) { this.stateMachine = v; return this; }
         public Builder tracer(Tracer v) { this.tracer = v; return this; }
 
         public RaftNode build() {

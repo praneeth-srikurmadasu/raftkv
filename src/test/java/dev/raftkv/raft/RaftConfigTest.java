@@ -21,9 +21,9 @@ class RaftConfigTest {
 
     @Test
     void heartbeatMustBeShorterThanTheElectionTimeout() {
-        assertThatThrownBy(() -> new RaftConfig(Duration.ofMillis(150), Duration.ofMillis(300), Duration.ofMillis(150), Set.of()))
+        assertThatThrownBy(() -> new RaftConfig(Duration.ofMillis(150), Duration.ofMillis(300), Duration.ofMillis(150), 64, Set.of()))
                 .isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new RaftConfig(Duration.ofMillis(300), Duration.ofMillis(150), Duration.ofMillis(50), Set.of()))
+        assertThatThrownBy(() -> new RaftConfig(Duration.ofMillis(300), Duration.ofMillis(150), Duration.ofMillis(50), 64, Set.of()))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 

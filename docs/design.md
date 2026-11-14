@@ -53,6 +53,20 @@ This document grows with every milestone. It records **what** we built, **why** 
 | Invariant checks | Run after every simulated event via `Simulation.addInvariant` | Check only at the end of a run | A violation is reported at the exact moment it happens, with the seed and virtual time. |
 | Debugging aid | `Simulation.echoTraceTo(sink)` streams every trace line | Only the last 200 lines | Needed to understand failures that start long before they are detected. |
 
+### Key decisions (Milestone 3)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Replication trigger | Send on every proposal, on every heartbeat tick, and right after a success reply while the follower is behind | Only on heartbeat ticks | Low commit latency without a separate pipeline; true bounded pipelining comes in Milestone 11. |
+| Overlapping messages | Allowed; followers are idempotent and the leader uses `matchIndex` from each reply | One outstanding AppendEntries per follower | Simpler, and correctness doesn't depend on message order (Raft tolerates reordering). |
+| Flow control | A success reply triggers the next send only if it advanced `matchIndex`; a rejection triggers a retry only if it lowered `nextIndex` | Send on every reply | Sending on every reply caused unbounded message amplification on duplicating networks (found by the stress run: out-of-memory); this rule keeps at most a few chains per follower. |
+| `matchIndex` in replies | Follower reports `prevLogIndex + entries.size()` | Leader infers from what it sent | Lets the leader handle duplicated and reordered replies safely. |
+| Rejections | Only lower `nextIndex`, never below `matchIndex + 1` | Apply conflict hints blindly | A rejection may be stale; this bound keeps it harmless. |
+| Batch size | `maxEntriesPerAppend` (default 64) | Byte-based limits | Entry count is enough until real payloads (Milestone 5); byte limits arrive with flow control in Milestone 11. |
+| Applying | Synchronously on the event loop, immediately after `commitIndex` advances | Separate applier thread | The state machine is in memory; a dedicated applier is only worth it for slow state machines. |
+| Overwriting a committed entry | `IllegalStateException` in the follower | Silently truncate | It can only happen if safety is already broken; failing loudly reports the seed. |
+| Volatile state machine | Re-applied from index 1 after a restart | Persist `lastApplied` | Matches Figure 2 (commitIndex/lastApplied are volatile); snapshots remove the replay in Milestone 8. |
+
 ### Known limitation (until Milestone 11)
 A node that misses heartbeats (briefly partitioned) can time out right after it reconnects; its higher term then makes the healthy leader step down through Fig. 2's "higher term → follower" rule. Safety is unaffected, but it costs an election. Pre-vote removes this. The chaos test lets the group settle for 2 s after healing before checking stability.
 
@@ -62,4 +76,4 @@ A node that misses heartbeats (briefly partitioned) can time out right after it 
 2. **Simulation location.** SPEC lists `Simulation` under the test tree but `SimulatedNetwork` under `src/main`. Since the network depends on the simulation, both live in `src/main` (`dev.raftkv.sim`, `dev.raftkv.transport.sim`). This also lets the benchmarks and demos reuse them.
 3. **Correlation ids for Raft.** SPEC §5.2 describes request/response matching by correlation id. Raft messages don't use it (see "communication style" above); it remains in the frame for client RPCs.
 4. **Bug switches.** SPEC §9.6 describes `static final` flags enabled through a separate build profile. Instead, bugs are an `EnumSet` inside `RaftConfig` (`RaftConfig.defaults()` has none). This lets one test run compare buggy and correct code side by side with no special build, at the cost of one set lookup per guarded line. Only test code ever enables a bug.
-5. **Milestone 2 heartbeats.** Followers already run the Figure 2 consistency check on heartbeats and reply success/failure, but don't append entries yet; that is Milestone 3.
+5. **Bug detection by targeted tests.** `COMMIT_INDEX_FROM_LAST_LOG_INDEX` is detected by a rule-level test, because this leader design never creates the situation where the bug does damage. `COMMIT_PREVIOUS_TERM_BY_COUNT` is detected by the scripted Figure 8 test, because random chaos reaches a Figure 8 shape too rarely to rely on (see docs/learning/03-log-replication.md §8).

@@ -82,7 +82,8 @@ final class ElectionChaos {
         }
     }
 
-    private static void act(SimulatedCluster c, Random r, boolean partitions, boolean crashes) {
+    /** One random nemesis action (shared with {@link ReplicationChaos}). */
+    static void act(SimulatedCluster c, Random r, boolean partitions, boolean crashes) {
         int choice = r.nextInt(6);
         List<NodeId> ids = c.ids;
         if (partitions && choice == 0) {
