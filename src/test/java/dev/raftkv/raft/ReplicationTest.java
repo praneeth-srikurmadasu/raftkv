@@ -230,12 +230,14 @@ class ReplicationTest {
     }
 
     @Test
-    void singleNodeGroupCommitsImmediately() {
+    void singleNodeGroupCommitsAsSoonAsItsOwnLogIsSynced() {
         SimulatedCluster c = new SimulatedCluster(1, 1, CONFIG);
         c.startAll();
         c.awaitLeader(Duration.ofSeconds(1));
         CompletableFuture<CommitResult> f = c.propose("solo");
-        assertThat(f.isDone()).isTrue();
+        assertThat(f.isDone()).isFalse();          // not before its own fsync (the scheduled flush)
+        c.sim.step();                              // run the flush
+        assertThat(f.isDone()).isTrue();           // no network round trip needed
         assertThat(f.join().result()).isEqualTo(Bytes.ofUtf8("ok:solo"));
     }
 }

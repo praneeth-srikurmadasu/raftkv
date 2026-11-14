@@ -29,5 +29,10 @@ public enum Bug {
     /** Follower always truncates after prevLogIndex, even when entries match, so a stale message deletes newer entries. */
     TRUNCATE_ON_STALE_APPEND,
     /** A new leader does not append a no-op, so entries from earlier terms never commit without new traffic (§8). */
-    NO_NOOP_ON_ELECTION
+    NO_NOOP_ON_ELECTION,
+
+    // ---- Milestone 4: persistence
+
+    /** Acknowledge entries (and count the leader's own copy) without fsyncing the log first. */
+    REPLY_BEFORE_FSYNC
 }

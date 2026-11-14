@@ -67,6 +67,20 @@ This document grows with every milestone. It records **what** we built, **why** 
 | Overwriting a committed entry | `IllegalStateException` in the follower | Silently truncate | It can only happen if safety is already broken; failing loudly reports the seed. |
 | Volatile state machine | Re-applied from index 1 after a restart | Persist `lastApplied` | Matches Figure 2 (commitIndex/lastApplied are volatile); snapshots remove the replay in Milestone 8. |
 
+### Key decisions (Milestone 4)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| File access | All storage goes through a small `Disk` interface | Using `FileChannel` directly | Lets tests run on `SimulatedDisk`, which models lost, torn and reordered unsynced writes and undone renames. |
+| Meta file | tmp file → fsync → atomic rename → directory fsync, CRC, fatal on corruption | In-place overwrite; append-only meta log | The rename protocol gives "old or new, never a mix" with a 25-byte file. |
+| Log layout | Segment files named by first index; `[len][crc][index][term][type][data]` records | One big file | Snapshots delete whole old segments; recovery reads only what is needed. |
+| Recovery | Bad record in the last segment = torn tail (truncate); in an earlier segment, or a gap = corruption (refuse to start) | Always truncate | Guessing could silently drop acknowledged entries. Valid because the rolling and truncation rules confine crash damage to the last segment. |
+| Rolling | fsync old segment + directory before creating the next | fsync only on `sync()` | Without it a crash could keep a later segment's name and lose an earlier one's (found by the property test). |
+| Truncation | Delete newest-first with a directory sync per delete, then truncate + fsync, before any new write | Batch delete + one sync | File systems persist unsynced deletes in any order; batching left gaps after crashes (found by the property test). |
+| Follower durability | fsync if the log changed **or** the reply covers non-durable entries | fsync only on change | Covers entries appended during a brief leadership whose flush never ran. |
+| Leader durability | Append, replicate immediately, fsync in a scheduled flush; count own copy only after it | fsync before replicating | Overlaps the leader's fsync with the network round trip (thesis §10.2.1) and batches fsyncs (group commit). |
+| Windows | Directory fsync is a no-op | Fail | Windows can't open directories as channels; NTFS journals metadata. |
+
 ### Known limitation (until Milestone 11)
 A node that misses heartbeats (briefly partitioned) can time out right after it reconnects; its higher term then makes the healthy leader step down through Fig. 2's "higher term → follower" rule. Safety is unaffected, but it costs an election. Pre-vote removes this. The chaos test lets the group settle for 2 s after healing before checking stability.
 
@@ -77,3 +91,4 @@ A node that misses heartbeats (briefly partitioned) can time out right after it 
 3. **Correlation ids for Raft.** SPEC §5.2 describes request/response matching by correlation id. Raft messages don't use it (see "communication style" above); it remains in the frame for client RPCs.
 4. **Bug switches.** SPEC §9.6 describes `static final` flags enabled through a separate build profile. Instead, bugs are an `EnumSet` inside `RaftConfig` (`RaftConfig.defaults()` has none). This lets one test run compare buggy and correct code side by side with no special build, at the cost of one set lookup per guarded line. Only test code ever enables a bug.
 5. **Bug detection by targeted tests.** `COMMIT_INDEX_FROM_LAST_LOG_INDEX` is detected by a rule-level test, because this leader design never creates the situation where the bug does damage. `COMMIT_PREVIOUS_TERM_BY_COUNT` is detected by the scripted Figure 8 test, because random chaos reaches a Figure 8 shape too rarely to rely on (see docs/learning/03-log-replication.md §8).
+6. **Durable state machine.** The state machine is still rebuilt by replaying the log after a restart; persisting it is the job of snapshots (Milestone 8).

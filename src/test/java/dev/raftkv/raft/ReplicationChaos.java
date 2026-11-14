@@ -42,11 +42,16 @@ final class ReplicationChaos {
     }
 
     static Result run(long seed, RaftConfig config) {
+        return run(seed, config, SimulatedCluster.Storage.MEMORY);
+    }
+
+    /** With {@link SimulatedCluster.Storage#DISK}, every crash also loses or tears unsynced disk writes. */
+    static Result run(long seed, RaftConfig config, SimulatedCluster.Storage storage) {
         Random r = new Random(seed);
         int size = r.nextBoolean() ? 3 : 5;
         // Small batches stress backtracking and partial matches; large ones exercise bulk catch-up.
         int batch = r.nextInt(3) == 0 ? 1 + r.nextInt(3) : 1 + r.nextInt(64);
-        SimulatedCluster c = new SimulatedCluster(seed, size, config.withMaxEntriesPerAppend(batch));
+        SimulatedCluster c = new SimulatedCluster(seed, size, config.withMaxEntriesPerAppend(batch), Map.of(), 0, storage);
         Map<Long, String> acknowledged = new TreeMap<>();
         try {
             boolean partitions = r.nextInt(4) != 0;

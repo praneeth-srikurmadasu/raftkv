@@ -4,7 +4,7 @@ A sharded, fault-tolerant distributed key-value store built on the Raft consensu
 
 [![CI](https://github.com/praneeth-srikurmadasu/raftkv/actions/workflows/ci.yml/badge.svg)](https://github.com/praneeth-srikurmadasu/raftkv/actions/workflows/ci.yml)
 
-> **Status:** Milestone 3 (log replication) complete. The full plan is in [SPEC.md](SPEC.md).
+> **Status:** Milestone 4 (persistence) complete. The full plan is in [SPEC.md](SPEC.md).
 
 ## Progress
 
@@ -14,8 +14,8 @@ A sharded, fault-tolerant distributed key-value store built on the Raft consensu
 | 1 | Skeleton, injectable clock/scheduler, binary codec, deterministic simulation | ✅ |
 | 2 | Leader election | ✅ |
 | 3 | Log replication | ✅ |
-| 4 | Persistence (MetaStore, segmented log, simulated disk) | ⏳ next |
-| 5 | KV state machine, sessions, client library | |
+| 4 | Persistence (MetaStore, segmented log, simulated disk) | ✅ |
+| 5 | KV state machine, sessions, client library | ⏳ next |
 | 6 | Linearizability checker + chaos suite | |
 | 7 | Real TCP transport, CLI, real cluster | |
 | 8 | Snapshots and log compaction | |
@@ -49,10 +49,11 @@ raftkv/
 ├── src/main/java/dev/raftkv/
 │   ├── common/              Bytes, NodeId, GroupId, Clock, Scheduler, Hashing, EventLoopScheduler
 │   ├── codec/               BinaryWriter/Reader, Frame, FrameCodec, FrameDecoder
+│   ├── io/                  Disk, RealDisk; sim/SimulatedDisk (loses unsynced data on crash)
 │   ├── protocol/            sealed Message, the 7 Raft messages, MessageCodec
 │   ├── raft/                RaftNode (election + replication), LeaderState, StateMachine, RaftConfig, Bug
-│   │   ├── log/             RaftLog, InMemoryLog, LogEntry, EntryType
-│   │   └── storage/         PersistentState, MetaStore, InMemoryMetaStore
+│   │   ├── log/             RaftLog, InMemoryLog, SegmentedFileLog, LogEntry, EntryType
+│   │   └── storage/         PersistentState, MetaStore, FileMetaStore, InMemoryMetaStore
 │   ├── sim/                 Simulation (virtual time, seeded event order, trace hash)
 │   └── transport/           Transport interface; sim/SimulatedNetwork
 ├── src/test/java/dev/raftkv/    tests (same package layout)
@@ -72,6 +73,7 @@ Every simulation test prints its seed when it fails. Re-run exactly that executi
 .\mvnw.cmd test "-Dtest=DeterminismTest" "-Draftkv.seed=8812734"
 .\mvnw.cmd test "-Dtest=ElectionChaosTest" "-Draftkv.seeds=5000"   # more chaos seeds
 .\mvnw.cmd test "-Dtest=ReplicationChaosTest" "-Draftkv.seeds=10000"
+.\mvnw.cmd test "-Dtest=PersistenceChaosTest" "-Draftkv.seeds=5000"
 ```
 
 ## License

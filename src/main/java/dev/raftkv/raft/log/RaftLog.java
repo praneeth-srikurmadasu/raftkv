@@ -15,7 +15,7 @@ import java.util.List;
  *   <li>terms never decrease along the log.</li>
  * </ul>
  */
-public interface RaftLog {
+public interface RaftLog extends AutoCloseable {
 
     /** Index of the last entry, or 0 if the log is empty. */
     long lastIndex();
@@ -37,9 +37,27 @@ public interface RaftLog {
     /** Entries from {@code fromIndex} (inclusive), at most {@code maxCount} of them. */
     List<LogEntry> entriesFrom(long fromIndex, int maxCount);
 
-    /** Appends entries that directly follow the current last entry. */
+    /**
+     * Appends entries that directly follow the current last entry. On a persistent log the
+     * entries are not durable until {@link #sync()} returns.
+     */
     void append(List<LogEntry> entries);
 
-    /** Deletes the entry at {@code fromIndex} and every entry after it (Fig.2 AppendEntries rule 3). */
+    /**
+     * Makes every appended entry durable. Raft calls this before acknowledging entries to a
+     * leader, and before a leader counts its own copy toward a majority. Default: no-op (memory).
+     */
+    default void sync() {
+    }
+
+    /**
+     * Deletes the entry at {@code fromIndex} and every entry after it (Fig.2 AppendEntries rule 3).
+     * On a persistent log the truncation is durable when this returns.
+     */
     void truncateSuffix(long fromIndex);
+
+    /** Releases files. Default: nothing to release. */
+    @Override
+    default void close() {
+    }
 }

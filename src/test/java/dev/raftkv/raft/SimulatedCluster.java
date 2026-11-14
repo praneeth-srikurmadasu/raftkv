@@ -12,11 +12,17 @@ import java.util.TreeSet;
 import java.util.HashMap;
 import java.util.concurrent.CompletableFuture;
 
+import java.nio.file.Path;
+
 import dev.raftkv.common.Bytes;
 import dev.raftkv.common.GroupId;
 import dev.raftkv.common.NodeId;
+import dev.raftkv.io.sim.SimulatedDisk;
 import dev.raftkv.raft.log.LogEntry;
+import dev.raftkv.raft.log.SegmentedFileLog;
+import dev.raftkv.raft.storage.FileMetaStore;
 import dev.raftkv.raft.storage.InMemoryMetaStore;
+import dev.raftkv.raft.storage.MetaStore;
 import dev.raftkv.raft.storage.PersistentState;
 import dev.raftkv.sim.Simulation;
 import dev.raftkv.transport.Transport;
@@ -25,10 +31,19 @@ import dev.raftkv.transport.sim.SimulatedNetwork;
 /**
  * A whole Raft group running inside one {@link Simulation}.
  *
- * <p>Each node has <em>durable</em> state (its {@link InMemoryMetaStore} and log,
- * which the cluster keeps) and <em>volatile</em> state (the {@link RaftNode} object). Crashing
- * a node throws the RaftNode away and takes it off the network; restarting builds a fresh
- * RaftNode on the same durable state, exactly like a process restart on the same disk.
+ * <p>Each node has <em>durable</em> state and <em>volatile</em> state (the {@link RaftNode}
+ * object). Crashing a node throws the RaftNode away and takes it off the network; restarting
+ * builds a fresh RaftNode on the durable state, exactly like a process restart.
+ *
+ * <p>Two storage modes:
+ * <ul>
+ *   <li>{@link Storage#MEMORY}: an in-memory meta store and log that never lose anything
+ *       (fast; the default for election and replication tests).</li>
+ *   <li>{@link Storage#DISK}: the real {@link FileMetaStore} and {@link SegmentedFileLog} on a
+ *       {@link SimulatedDisk} per node. A crash also crashes the disk in
+ *       {@link SimulatedDisk.CrashMode#RANDOM} mode, so anything not fsynced may be lost or torn,
+ *       and the restarted node recovers from whatever survived.</li>
+ * </ul>
  *
  * <p>{@link ElectionInvariants} and {@link ReplicationInvariants} run after every simulated
  * event; State Machine Safety is checked by each node's {@link RecordingStateMachine}. The
@@ -36,7 +51,11 @@ import dev.raftkv.transport.sim.SimulatedNetwork;
  */
 final class SimulatedCluster {
 
+    enum Storage { MEMORY, DISK }
+
     static final GroupId GROUP = GroupId.of(1);
+    /** Small segments so tests exercise segment rolling. */
+    static final long SEGMENT_BYTES = 4096;
 
     final Simulation sim;
     final SimulatedNetwork net;
@@ -47,7 +66,9 @@ final class SimulatedCluster {
     /** index -> command, shared by every replica's state machine to check State Machine Safety. */
     final Map<Long, Bytes> globallyApplied = new HashMap<>();
 
-    private final Map<NodeId, InMemoryMetaStore> metaStores = new TreeMap<>();
+    final Storage storage;
+    private final Map<NodeId, MetaStore> metaStores = new TreeMap<>();
+    private final Map<NodeId, SimulatedDisk> disks = new TreeMap<>();
     private final Map<NodeId, TrackingLog> logs = new TreeMap<>();
     private final Map<NodeId, RecordingStateMachine> stateMachines = new TreeMap<>();
     private final Map<NodeId, Transport> transports = new TreeMap<>();
@@ -64,6 +85,17 @@ final class SimulatedCluster {
      * @param initialTerm currentTerm every node starts with (must be >= every initial log term)
      */
     SimulatedCluster(long seed, int size, RaftConfig config, Map<NodeId, List<LogEntry>> initialLogs, long initialTerm) {
+        this(seed, size, config, initialLogs, initialTerm, Storage.MEMORY);
+    }
+
+    /** A cluster whose nodes keep their state on simulated disks that lose unsynced data on crash. */
+    static SimulatedCluster withDisks(long seed, int size, RaftConfig config) {
+        return new SimulatedCluster(seed, size, config, Map.of(), 0, Storage.DISK);
+    }
+
+    SimulatedCluster(long seed, int size, RaftConfig config, Map<NodeId, List<LogEntry>> initialLogs, long initialTerm,
+                     Storage storage) {
+        this.storage = storage;
         this.sim = new Simulation(seed);
         this.net = new SimulatedNetwork(sim);
         this.config = config;
@@ -73,8 +105,19 @@ final class SimulatedCluster {
         }
         this.ids = List.copyOf(list);
         for (NodeId id : ids) {
-            metaStores.put(id, new InMemoryMetaStore(new PersistentState(initialTerm, null)));
-            logs.put(id, new TrackingLog(initialLogs.getOrDefault(id, List.of())));
+            if (storage == Storage.DISK) {
+                disks.put(id, new SimulatedDisk(sim.forkRandom()));
+                openDurableState(id);
+                if (initialTerm > 0) {
+                    metaStores.get(id).save(new PersistentState(initialTerm, null));
+                }
+                TrackingLog log = logs.get(id);
+                log.append(initialLogs.getOrDefault(id, List.of()));
+                log.sync();
+            } else {
+                metaStores.put(id, new InMemoryMetaStore(new PersistentState(initialTerm, null)));
+                logs.put(id, new TrackingLog(initialLogs.getOrDefault(id, List.of())));
+            }
             // The handler looks up whichever RaftNode currently runs as this id.
             transports.put(id, net.register(id, envelope -> {
                 RaftNode node = running.get(id);
@@ -126,7 +169,18 @@ final class SimulatedCluster {
         node.start();
     }
 
-    /** Kills the node: volatile state is gone, durable state stays, and it drops off the network. */
+    /** (Re)opens a node's meta store and log from its simulated disk, running recovery. */
+    private void openDurableState(NodeId id) {
+        SimulatedDisk disk = disks.get(id);
+        Path dir = Path.of("/data/n" + id.value());
+        metaStores.put(id, new FileMetaStore(disk, dir));
+        logs.put(id, new TrackingLog(SegmentedFileLog.open(disk, dir.resolve("log"), SEGMENT_BYTES)));
+    }
+
+    /**
+     * Kills the node: volatile state is gone and it drops off the network. With disks, the
+     * disk crashes too: whatever was not fsynced may be lost or torn.
+     */
     void crash(NodeId id) {
         RaftNode node = running.remove(id);
         if (node == null) {
@@ -134,15 +188,25 @@ final class SimulatedCluster {
         }
         node.stop();
         net.setNodeUp(id, false);
+        if (storage == Storage.DISK) {
+            disks.get(id).crash(SimulatedDisk.CrashMode.RANDOM);
+        }
     }
 
-    /** Starts a fresh RaftNode on the crashed node's durable state. */
+    /** Starts a fresh RaftNode on the crashed node's durable state (recovering it from disk first). */
     void restart(NodeId id) {
         if (running.containsKey(id)) {
             throw new IllegalStateException(id + " is already running");
         }
+        if (storage == Storage.DISK) {
+            openDurableState(id);
+        }
         net.setNodeUp(id, true);
         start(id);
+    }
+
+    SimulatedDisk disk(NodeId id) {
+        return disks.get(id);
     }
 
     boolean isRunning(NodeId id) {
@@ -165,7 +229,7 @@ final class SimulatedCluster {
         return ids.stream().filter(id -> !running.containsKey(id)).toList();
     }
 
-    InMemoryMetaStore metaStore(NodeId id) {
+    MetaStore metaStore(NodeId id) {
         return metaStores.get(id);
     }
 

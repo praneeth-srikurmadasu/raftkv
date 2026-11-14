@@ -50,8 +50,10 @@ import dev.raftkv.transport.Transport;
  * deterministic under simulation (SPEC §3.2).
  *
  * <p><b>Durability.</b> {@code currentTerm} and {@code votedFor} are saved through the
- * {@link MetaStore} before any message that depends on them is sent (Figure 2: "updated on
- * stable storage before responding to RPCs"). In this milestone {@code save} is synchronous.
+ * {@link MetaStore} before any message that depends on them is sent, and a follower fsyncs its
+ * log before acknowledging entries (Figure 2: "updated on stable storage before responding to
+ * RPCs"). A leader fsyncs its own new entries in a scheduled flush (group commit) while it
+ * replicates them, and counts its own copy toward a majority only once it is durable.
  *
  * <p>Comments of the form {@code // Fig.2 ...} point at the exact rule of Figure 2 of the
  * extended Raft paper that the line implements.
@@ -83,6 +85,11 @@ public final class RaftNode {
     private long commitIndex;
     /** Fig.2: index of highest log entry applied to state machine (initialized to 0, increases monotonically). */
     private long lastApplied;
+    /** Highest log index known to be on stable storage (the leader counts only this much of its own log). */
+    private long durableIndex;
+    /** A flush (log fsync) is already scheduled; more appends will ride along with it (group commit). */
+    private boolean flushScheduled;
+    private long logSyncs;
 
     // ---- Leader state (Fig.2 "volatile state on leaders"); null unless leader.
     private LeaderState leaderState;
@@ -152,6 +159,8 @@ public final class RaftNode {
         role = Role.FOLLOWER;
         commitIndex = 0;   // volatile: relearned from the leader
         lastApplied = 0;   // volatile: the state machine is rebuilt by re-applying the log
+        durableIndex = log.lastIndex(); // whatever survived the restart is on disk
+        flushScheduled = false;
         trace("started (votedFor=" + votedFor + ", last log " + log.lastIndex() + "@t" + log.lastTerm() + ")");
         resetElectionTimer();
     }
@@ -189,8 +198,8 @@ public final class RaftNode {
         log.append(List.of(entry));
         CompletableFuture<CommitResult> future = new CompletableFuture<>();
         pending.put(entry.index(), new Pending(entry.term(), future));
-        advanceCommitIndex(); // a single-node group commits immediately
-        replicateToAll();
+        scheduleFlush();  // our own fsync runs in the background ...
+        replicateToAll(); // ... while followers already receive the entry (thesis §10.2.1)
         return future;
     }
 
@@ -355,9 +364,20 @@ public final class RaftNode {
             return;
         }
 
-        appendNewEntries(ae);
-
+        boolean changed = appendNewEntries(ae);
         long lastNewIndex = prevIndex + ae.entries().size();
+        // Figure 2: persistent state is "updated on stable storage before responding to RPCs".
+        // The success reply below promises the leader that everything up to lastNewIndex
+        // survives a crash. Sync if the log changed, and ALSO if the reply covers entries we
+        // appended earlier but never synced (e.g. as a short-lived leader whose flush hadn't run).
+        if (changed || lastNewIndex > durableIndex) {
+            if (!config.has(Bug.REPLY_BEFORE_FSYNC)) {
+                log.sync();
+                logSyncs++;
+            }
+            durableIndex = log.lastIndex();
+        }
+        durableIndex = Math.min(durableIndex, log.lastIndex());
         // Fig.2 AppendEntries rule 5: "If leaderCommit > commitIndex, set commitIndex =
         // min(leaderCommit, index of last new entry)". NOT the last index of our log: entries
         // beyond lastNewIndex were not checked against the leader and may be stale.
@@ -372,15 +392,15 @@ public final class RaftNode {
         send(from, new AppendEntriesReply(currentTerm, true, lastNewIndex, 0, 0));
     }
 
-    /** Fig.2 AppendEntries rules 3 and 4. */
-    private void appendNewEntries(AppendEntries ae) {
+    /** Fig.2 AppendEntries rules 3 and 4. Returns true if the log changed. */
+    private boolean appendNewEntries(AppendEntries ae) {
         List<LogEntry> entries = ae.entries();
         if (config.has(Bug.TRUNCATE_ON_STALE_APPEND)) {
             if (log.lastIndex() > ae.prevLogIndex()) {
                 log.truncateSuffix(ae.prevLogIndex() + 1);
             }
             log.append(entries);
-            return;
+            return true;
         }
         for (int i = 0; i < entries.size(); i++) {
             LogEntry e = entries.get(i);
@@ -398,7 +418,36 @@ public final class RaftNode {
             }
             // Rule 4: "Append any new entries not already in the log".
             log.append(entries.subList(i, entries.size()));
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Schedules one fsync of our own log on the event loop. Every append made before it runs is
+     * covered by the same fsync: that's group commit (SPEC §3.7). Until it completes, the leader
+     * does not count its own copy of those entries toward a majority.
+     */
+    private void scheduleFlush() {
+        if (flushScheduled) {
             return;
+        }
+        flushScheduled = true;
+        scheduler.execute(this::flush);
+    }
+
+    private void flush() {
+        flushScheduled = false;
+        if (!running) {
+            return;
+        }
+        if (!config.has(Bug.REPLY_BEFORE_FSYNC)) {
+            log.sync();
+            logSyncs++;
+        }
+        durableIndex = log.lastIndex();
+        if (role == Role.LEADER) {
+            advanceCommitIndex();
         }
     }
 
@@ -498,7 +547,8 @@ public final class RaftNode {
      */
     private void advanceCommitIndex() {
         List<Long> matches = new ArrayList<>();
-        matches.add(log.lastIndex()); // the leader's own log
+        // The leader's own copy counts only once it is on disk (thesis §10.2.1).
+        matches.add(config.has(Bug.REPLY_BEFORE_FSYNC) ? log.lastIndex() : durableIndex);
         for (long m : leaderState.matchIndexes()) {
             matches.add(m);
         }
@@ -623,8 +673,8 @@ public final class RaftNode {
         // current term (Figure 8), so without this they could wait forever for a client write.
         if (!config.has(Bug.NO_NOOP_ON_ELECTION)) {
             log.append(List.of(LogEntry.noop(log.lastIndex() + 1, currentTerm)));
+            scheduleFlush();
         }
-        advanceCommitIndex(); // a single-node group commits the no-op at once
         // Fig.2 Leaders: "Upon election: send initial empty AppendEntries RPCs (heartbeat) to
         // each server; repeat during idle periods to prevent election timeouts (§5.2)".
         sendHeartbeats();
@@ -761,6 +811,11 @@ public final class RaftNode {
     /** The leader's matchIndex for {@code peer}; empty unless this node is leader. */
     public Optional<Long> matchIndexOf(NodeId peer) {
         return leaderState == null || peer.equals(self) ? Optional.empty() : Optional.of(leaderState.matchIndex(peer));
+    }
+
+    /** How many times this node has fsynced its log (tests check group commit with it). */
+    public long logSyncs() {
+        return logSyncs;
     }
 
     /** Number of proposals still waiting to be applied (tests and metrics). */
