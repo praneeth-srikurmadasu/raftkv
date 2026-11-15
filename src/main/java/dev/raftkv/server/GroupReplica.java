@@ -4,6 +4,7 @@ import java.util.Objects;
 
 import dev.raftkv.common.GroupId;
 import dev.raftkv.common.Scheduler;
+import dev.raftkv.protocol.ClientRequest;
 import dev.raftkv.protocol.RaftMessage;
 import dev.raftkv.raft.RaftNode;
 import dev.raftkv.raft.StateMachine;
@@ -26,9 +27,10 @@ public final class GroupReplica {
     private final MessageHandler service;
     private final Runnable onStart;
     private final Runnable onStop;
+    private final Admin admin;
 
     GroupReplica(GroupId group, Scheduler scheduler, RaftNode node, StateMachine stateMachine, RaftLog log,
-                 MessageHandler service, Runnable onStart, Runnable onStop) {
+                 MessageHandler service, Runnable onStart, Runnable onStop, dev.raftkv.transport.Transport transport) {
         this.group = Objects.requireNonNull(group, "group");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         this.node = Objects.requireNonNull(node, "node");
@@ -37,20 +39,32 @@ public final class GroupReplica {
         this.service = Objects.requireNonNull(service, "service");
         this.onStart = Objects.requireNonNull(onStart, "onStart");
         this.onStop = Objects.requireNonNull(onStop, "onStop");
+        this.admin = new Admin(group, node, stateMachine, Objects.requireNonNull(transport, "transport"));
     }
 
     /** Hands a message to this replica's event loop (any thread). */
     public void deliver(Envelope envelope) {
-        scheduler.execute(() -> {
+        try {
+            scheduler.execute(() -> dispatch(envelope));
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // The replica is shutting down and its event loop is closed: the message is dropped,
+            // as if it had arrived a moment later. (It must never reach the network thread.)
+        }
+    }
+
+    private void dispatch(Envelope envelope) {
+        {
             if (!node.isRunning()) {
                 return;
             }
             if (envelope.message() instanceof RaftMessage) {
                 node.handle(envelope);
+            } else if (envelope.message() instanceof ClientRequest r && Admin.isAdmin(r.command())) {
+                admin.handle(envelope, r);
             } else {
                 service.onMessage(envelope);
             }
-        });
+        }
     }
 
     /** Recovers from storage and starts the Raft node and the service's background work. */

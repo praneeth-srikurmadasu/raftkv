@@ -17,9 +17,11 @@ import dev.raftkv.raft.log.LogEntry;
  * @param prevLogTerm  term of the prevLogIndex entry
  * @param entries      entries to store (empty for heartbeat); indexes are prevLogIndex+1, +2, ...
  * @param leaderCommit leader's commitIndex
+ * @param round        the leader's heartbeat round when sent, echoed in the reply; confirms
+ *                     leadership for ReadIndex and leases (SPEC §4.4), 0 if unused
  */
 public record AppendEntries(long term, NodeId leaderId, long prevLogIndex, long prevLogTerm,
-                            List<LogEntry> entries, long leaderCommit) implements RaftMessage {
+                            List<LogEntry> entries, long leaderCommit, long round) implements RaftMessage {
 
     public AppendEntries {
         nonNegative(term, "term");
@@ -27,6 +29,7 @@ public record AppendEntries(long term, NodeId leaderId, long prevLogIndex, long 
         nonNegative(prevLogIndex, "prevLogIndex");
         nonNegative(prevLogTerm, "prevLogTerm");
         nonNegative(leaderCommit, "leaderCommit");
+        nonNegative(round, "round");
         entries = List.copyOf(entries); // immutable, and rejects null elements
         for (int i = 0; i < entries.size(); i++) {
             long expected = prevLogIndex + 1 + i;
@@ -35,6 +38,12 @@ public record AppendEntries(long term, NodeId leaderId, long prevLogIndex, long 
                         + ", expected " + expected + " (entries must directly follow prevLogIndex)");
             }
         }
+    }
+
+    /** An AppendEntries outside any heartbeat round. */
+    public AppendEntries(long term, NodeId leaderId, long prevLogIndex, long prevLogTerm,
+                         List<LogEntry> entries, long leaderCommit) {
+        this(term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit, 0);
     }
 
     /** True if this is a heartbeat (carries no entries). */

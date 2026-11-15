@@ -18,6 +18,7 @@ import dev.raftkv.linearizability.History;
 import dev.raftkv.linearizability.LinearizabilityChecker;
 import dev.raftkv.linearizability.Operation;
 import dev.raftkv.raft.RaftConfig;
+import dev.raftkv.raft.ReadMode;
 import dev.raftkv.sim.SimulationException;
 
 /**
@@ -89,6 +90,13 @@ final class ShardedChaos {
         int numShards = 4 + r.nextInt(9);
         boolean colocated = r.nextInt(3) == 0;
         RaftConfig config = r.nextBoolean() ? baseConfig : baseConfig.withSnapshots(10 + r.nextInt(70), 256 + r.nextInt(4000));
+        // Milestone 11 swarm (separate stream, so the choices above stay as they were): read mode,
+        // pipelining window, pre-vote and check-quorum (always on with leases).
+        Random m11 = new Random(seed ^ 0x11_5EED_C0DEL);
+        ReadMode mode = ReadMode.values()[m11.nextInt(3)];
+        config = config.withReadMode(mode)
+                .withMaxInflightAppends(new int[] {1, 2, 8}[m11.nextInt(3)])
+                .withElectionExtensions(m11.nextInt(4) != 0, mode == ReadMode.LEASE || m11.nextInt(4) != 0);
         ShardedCluster c = new ShardedCluster(seed, GROUPS, numShards, config, storage, colocated);
         History history = new History(c.sim::now);
         int configs = 0;

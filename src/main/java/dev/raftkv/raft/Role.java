@@ -1,18 +1,20 @@
 package dev.raftkv.raft;
 
 /**
- * The role a server plays (Raft §5.1, Figure 4).
+ * The role a server plays (Raft §5.1, Figure 4, plus the thesis extensions of SPEC §3.3).
  *
  * <pre>
- *   FOLLOWER --(election timeout)--> CANDIDATE --(majority of votes)--> LEADER
- *       ^                               |                                 |
- *       +----(discovers current leader or a higher term)------------------+
- * </pre>
+ *   FOLLOWER --(timeout)--> PRE_CANDIDATE --(pre-vote majority)--> CANDIDATE --(vote majority)--> LEADER
+ *       ^                        |                                    |                            |
+ *       +----(hears a leader, sees a higher term, or loses its quorum: check-quorum)---------------+
  *
- * PRE_CANDIDATE (pre-vote) and LEARNER (non-voting member) are added in later milestones.
+ *   LEARNER: not a voter in the current membership; receives the log, never starts an election.
+ * </pre>
  */
 public enum Role {
     FOLLOWER,
+    PRE_CANDIDATE,
     CANDIDATE,
-    LEADER
+    LEADER,
+    LEARNER
 }

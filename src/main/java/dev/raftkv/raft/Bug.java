@@ -57,5 +57,19 @@ public enum Bug {
     /** The new owner tells the old one to delete a shard as soon as it fetched it, before installing it. */
     GC_BEFORE_INSERT_COMMITTED,
     /** Shard ownership is checked when a request arrives but not again when it is applied. */
-    CHECK_OWNERSHIP_ON_RECEIVE_ONLY
+    CHECK_OWNERSHIP_ON_RECEIVE_ONLY,
+
+    // ---- Milestone 11: reads and elections
+
+    /** ReadIndex serves the read without confirming leadership with a heartbeat round. */
+    READINDEX_WITHOUT_HEARTBEAT,
+    /** Followers grant votes even while they hear from a leader, which makes leases unsafe. */
+    LEASE_WITHOUT_STICKINESS,
+    /** A node restarts its election timer when it REJECTS a vote, so stale candidates can keep it from ever campaigning. */
+    RESET_TIMER_ON_REJECTED_VOTE,
+
+    // ---- Milestone 12: membership changes
+
+    /** A new leader proposes a membership change before any entry of its own term has committed. */
+    CONFIG_CHANGE_BEFORE_CURRENT_TERM_COMMIT
 }

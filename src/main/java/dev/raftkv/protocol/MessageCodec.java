@@ -56,6 +56,7 @@ public final class MessageCodec {
                 w.writeLong(m.prevLogIndex());
                 w.writeLong(m.prevLogTerm());
                 w.writeLong(m.leaderCommit());
+                w.writeLong(m.round());
                 w.writeInt(m.entries().size());
                 for (LogEntry e : m.entries()) {
                     writeEntry(w, e);
@@ -67,6 +68,7 @@ public final class MessageCodec {
                 w.writeLong(m.matchIndex());
                 w.writeLong(m.conflictIndex());
                 w.writeLong(m.conflictTerm());
+                w.writeLong(m.round());
             }
             case InstallSnapshot m -> {
                 w.writeLong(m.term());
@@ -144,7 +146,7 @@ public final class MessageCodec {
                 case REQUEST_VOTE_REPLY -> new RequestVoteReply(r.readLong(), r.readBoolean(), r.readBoolean());
                 case APPEND_ENTRIES -> decodeAppendEntries(r);
                 case APPEND_ENTRIES_REPLY -> new AppendEntriesReply(r.readLong(), r.readBoolean(), r.readLong(),
-                        r.readLong(), r.readLong());
+                        r.readLong(), r.readLong(), r.readLong());
                 case INSTALL_SNAPSHOT -> new InstallSnapshot(r.readLong(), readNodeId(r), r.readLong(), r.readLong(),
                         r.readLong(), r.readBytes(), r.readBoolean());
                 case INSTALL_SNAPSHOT_REPLY -> new InstallSnapshotReply(r.readLong(), r.readLong(), r.readLong(), r.readBoolean());
@@ -188,6 +190,7 @@ public final class MessageCodec {
         long prevLogIndex = r.readLong();
         long prevLogTerm = r.readLong();
         long leaderCommit = r.readLong();
+        long round = r.readLong();
         int count = r.readInt();
         // Never allocate based on an untrusted count: each entry needs at least MIN_ENTRY_BYTES.
         if (count < 0 || count > r.remaining() / MIN_ENTRY_BYTES) {
@@ -197,7 +200,7 @@ public final class MessageCodec {
         for (int i = 0; i < count; i++) {
             entries.add(readEntry(r));
         }
-        return new AppendEntries(term, leader, prevLogIndex, prevLogTerm, entries, leaderCommit);
+        return new AppendEntries(term, leader, prevLogIndex, prevLogTerm, entries, leaderCommit, round);
     }
 
     // ------------------------------------------------------------------ shared pieces

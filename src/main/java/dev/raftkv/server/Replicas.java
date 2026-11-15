@@ -84,7 +84,7 @@ public final class Replicas {
         StateMachine sm = p.stateMachineWrapper().apply(store);
         RaftNode node = p.node(sm);
         KVServer server = new KVServer(node, p.transport(), p.clock(), store);
-        return new GroupReplica(p.group(), p.scheduler(), node, store, p.log(), server::handle, () -> { }, () -> { });
+        return new GroupReplica(p.group(), p.scheduler(), node, store, p.log(), server::handle, () -> { }, () -> { }, p.transport());
     }
 
     /** A replica of the shard controller (group 0). */
@@ -96,7 +96,7 @@ public final class Replicas {
         StateMachine sm = p.stateMachineWrapper().apply(store);
         RaftNode node = p.node(sm);
         KVServer server = new KVServer(node, p.transport(), p.clock(), null, ControllerCodec::decode);
-        return new GroupReplica(p.group(), p.scheduler(), node, store, p.log(), server::handle, () -> { }, () -> { });
+        return new GroupReplica(p.group(), p.scheduler(), node, store, p.log(), server::handle, () -> { }, () -> { }, p.transport());
     }
 
     /** A replica of a data group of the sharded cluster. */
@@ -107,6 +107,6 @@ public final class Replicas {
         RaftNode node = p.node(sm);
         ShardKVServer server = new ShardKVServer(node, store, p.transport(), p.clock(), p.scheduler(), p.random(),
                 controllerServers, registry);
-        return new GroupReplica(p.group(), p.scheduler(), node, store, p.log(), server, server::start, server::stop);
+        return new GroupReplica(p.group(), p.scheduler(), node, store, p.log(), server, server::start, server::stop, p.transport());
     }
 }

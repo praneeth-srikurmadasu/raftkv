@@ -389,7 +389,12 @@ public final class NioTransport implements Transport, AutoCloseable {
             for (Frame f : frames) {
                 Message m = MessageCodec.fromFrame(f);
                 framesReceived.incrementAndGet();
-                handler.onMessage(new Envelope(c.remote, self, GroupId.of(f.groupId()), m));
+                try {
+                    handler.onMessage(new Envelope(c.remote, self, GroupId.of(f.groupId()), m));
+                } catch (RuntimeException e) {
+                    // A handler bug must not kill the network thread (and with it every connection).
+                    framesDropped.incrementAndGet();
+                }
             }
         }
     }

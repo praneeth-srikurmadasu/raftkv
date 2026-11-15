@@ -30,3 +30,6 @@ desktop.ini
 # Runtime data of locally started nodes
 data/
 *.log
+
+# Output of scripts/bench.ps1 (results differ per machine)
+bench-results.md

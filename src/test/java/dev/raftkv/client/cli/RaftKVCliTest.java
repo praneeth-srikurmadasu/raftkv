@@ -66,7 +66,7 @@ class RaftKVCliTest {
             assertThat(lines[15]).contains("on [n1, n2, n3]");
             assertThat(lines[16]).contains("-> group");
             assertThat(lines[17]).contains("now config");
-            assertThat(lines[18]).contains("admin needs join, leave or move");
+            assertThat(lines[18]).contains("admin needs join, leave, move");
             assertThat(lines[19]).isEqualTo(""); // the prompt for "quit"; nothing ran after it
             assertThat(lines.length).isEqualTo(20);
             assertThat(cli.client().get("fresh").orElseThrow()).isEqualTo("new"); // shard 0 moved, data intact
@@ -90,6 +90,22 @@ class RaftKVCliTest {
             assertThat(cli.run(List.of("nope"), sink)).isFalse();
             assertThat(cli.run(List.of("admin", "join", "4", "n9"), sink)).as("unknown server id").isFalse();
             assertThat(cli.client().get("a").orElseThrow()).isEqualTo("1");
+            ByteArrayOutputStream statusOut = new ByteArrayOutputStream();
+            assertThat(cli.run(List.of("status"), new PrintStream(statusOut, true, StandardCharsets.UTF_8))).isTrue();
+            String status = statusOut.toString(StandardCharsets.UTF_8);
+            assertThat(status).contains("g0 n1").contains("g1 n3").contains("LEADER");
+            ByteArrayOutputStream transferOut = new ByteArrayOutputStream();
+            assertThat(cli.run(List.of("admin", "transfer-leader", "1", "n2"), new PrintStream(transferOut, true, StandardCharsets.UTF_8)))
+                    .as("transfer output: %s", transferOut).isTrue();
+            assertThat(cli.client().get("a").orElseThrow()).isEqualTo("1");
         }
+    }
+
+    @Test
+    void pastedExamplesWorkWithPromptsAndComments() {
+        assertThat(RaftKVCli.clean("raftkv> put city Hyderabad")).isEqualTo("put city Hyderabad");
+        assertThat(RaftKVCli.clean("raftkv> raftkv> get city   # still works")).isEqualTo("get city");
+        assertThat(RaftKVCli.clean("  # just a comment")).isEqualTo("");
+        assertThat(RaftKVCli.clean("leader")).isEqualTo("leader");
     }
 }

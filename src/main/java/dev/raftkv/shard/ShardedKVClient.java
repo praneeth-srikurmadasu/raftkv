@@ -130,6 +130,6 @@ public final class ShardedKVClient implements KVClient {
 
     private CompletableFuture<KVResult> submit(KVCommand command) {
         Bytes encoded = KVCodec.encode(command);
-        return session.submit(encoded, command.key()).thenApply(KVCodec::decodeResult);
+        return session.submit(encoded, command.key(), command instanceof KVCommand.Get).thenApply(KVCodec::decodeResult);
     }
 }

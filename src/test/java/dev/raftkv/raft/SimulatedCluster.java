@@ -14,11 +14,11 @@ import java.util.concurrent.CompletableFuture;
 
 import java.nio.file.Path;
 
+import dev.raftkv.client.ClientConfig;
+import dev.raftkv.client.RaftKVClient;
 import dev.raftkv.common.Bytes;
 import dev.raftkv.common.GroupId;
 import dev.raftkv.common.NodeId;
-import dev.raftkv.client.ClientConfig;
-import dev.raftkv.client.RaftKVClient;
 import dev.raftkv.io.sim.SimulatedDisk;
 import dev.raftkv.kv.KVServer;
 import dev.raftkv.kv.KVStateMachine;
@@ -27,11 +27,11 @@ import dev.raftkv.raft.log.LogEntry;
 import dev.raftkv.raft.log.SegmentedFileLog;
 import dev.raftkv.raft.storage.FileMetaStore;
 import dev.raftkv.raft.storage.FileSnapshotStore;
-import dev.raftkv.raft.storage.InMemorySnapshotStore;
-import dev.raftkv.raft.storage.SnapshotStore;
 import dev.raftkv.raft.storage.InMemoryMetaStore;
+import dev.raftkv.raft.storage.InMemorySnapshotStore;
 import dev.raftkv.raft.storage.MetaStore;
 import dev.raftkv.raft.storage.PersistentState;
+import dev.raftkv.raft.storage.SnapshotStore;
 import dev.raftkv.sim.Simulation;
 import dev.raftkv.transport.Transport;
 import dev.raftkv.transport.sim.SimulatedNetwork;
@@ -88,6 +88,11 @@ final class SimulatedCluster {
     private final Map<NodeId, KVServer> kvServers = new TreeMap<>();
     private final List<RaftKVClient> clients = new ArrayList<>();
 
+    /** Voters a node is built with when its log and snapshot hold no membership (default: every id). */
+    private java.util.SortedSet<NodeId> bootstrapVoters;
+    /** Per-node clock rate (1.0 = accurate), to break leases on purpose. */
+    private final Map<NodeId, Double> clockRates = new TreeMap<>();
+
     /** Optional hook that sees every message as it is delivered (tests count specific messages). */
     java.util.function.Consumer<dev.raftkv.transport.Envelope> deliveryObserver = e -> { };
 
@@ -134,6 +139,7 @@ final class SimulatedCluster {
             list.add(NodeId.of(i));
         }
         this.ids = List.copyOf(list);
+        this.bootstrapVoters = new TreeSet<>(ids);
         for (NodeId id : ids) {
             if (storage == Storage.DISK) {
                 disks.put(id, new SimulatedDisk(sim.forkRandom()));
@@ -171,6 +177,33 @@ final class SimulatedCluster {
         sim.addInvariant(replicationInvariants);
     }
 
+    /**
+     * The initial membership (set before starting nodes): the other nodes start outside the group
+     * and only join through membership changes (Milestone 12).
+     */
+    void setBootstrapVoters(Collection<NodeId> voters) {
+        this.bootstrapVoters = new TreeSet<>(voters);
+    }
+
+    /**
+     * Makes {@code id}'s clock run at {@code rate} times real time from now on (set before it
+     * starts). Leases assume rates within {@code 1 ± maxClockDrift}; a slower clock makes a leader
+     * believe its lease lasts longer than it really does.
+     */
+    void setClockRate(NodeId id, double rate) {
+        clockRates.put(id, rate);
+    }
+
+    private dev.raftkv.common.Clock clockFor(NodeId id) {
+        Double rate = clockRates.get(id);
+        if (rate == null) {
+            return sim.clock();
+        }
+        dev.raftkv.common.Clock real = sim.clock();
+        long start = real.nanos();
+        return () -> start + (long) ((real.nanos() - start) * rate);
+    }
+
     void startAll() {
         ids.forEach(this::start);
     }
@@ -194,10 +227,10 @@ final class SimulatedCluster {
         RaftNode node = RaftNode.builder()
                 .self(id)
                 .group(GROUP)
-                .voters(new TreeSet<>(ids))
+                .voters(bootstrapVoters)
                 .config(config)
                 .scheduler(sim)
-                .clock(sim.clock())
+                .clock(clockFor(id))
                 .random(sim.forkRandom())
                 .transport(transports.get(id))
                 .log(logs.get(id))

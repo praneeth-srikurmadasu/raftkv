@@ -187,6 +187,57 @@ public final class RaftHost implements MessageHandler, AutoCloseable {
         return result;
     }
 
+    /**
+     * Every number the metrics endpoint publishes for {@code group} on this node, read on the
+     * group's event loop (SPEC §8). Keys are stable metric names; values are numbers, strings or
+     * lists of shard numbers.
+     */
+    public CompletableFuture<Map<String, Object>> metrics(GroupId group) {
+        Optional<GroupReplica> r = router.replica(group);
+        if (r.isEmpty()) {
+            return CompletableFuture.failedFuture(new IllegalArgumentException("no " + group + " on " + self));
+        }
+        GroupReplica replica = r.get();
+        CompletableFuture<Map<String, Object>> result = new CompletableFuture<>();
+        replica.scheduler().execute(() -> {
+            try {
+                RaftNode n = replica.node();
+                Map<String, Object> m = new java.util.LinkedHashMap<>();
+                m.put("group", group.value());
+                m.put("role", n.role().toString());
+                m.put("term", n.currentTerm());
+                m.put("leader", n.leaderId().map(NodeId::value).orElse(-1));
+                m.put("commit_index", n.commitIndex());
+                m.put("last_applied", n.lastApplied());
+                m.put("last_log_index", n.log().lastIndex());
+                m.put("snapshot_index", n.log().snapshotIndex());
+                m.put("voters", n.membership().voters().stream().map(NodeId::value).toList());
+                m.put("learners", n.membership().learners().stream().map(NodeId::value).toList());
+                m.put("elections_started", n.electionsStarted());
+                m.put("pre_votes_started", n.preVotesStarted());
+                m.put("log_syncs", n.logSyncs());
+                m.put("snapshots_taken", n.snapshotsTaken());
+                m.put("snapshots_installed", n.snapshotsInstalled());
+                m.put("pending_proposals", n.pendingProposals());
+                m.put("pending_reads", n.pendingReads());
+                m.put("holds_lease", n.holdsLease() ? 1 : 0);
+                if (replica.stateMachine() instanceof ShardKVStateMachine s) {
+                    m.put("config_num", s.current().num());
+                    m.put("shards_serving", s.shardsIn(ShardStatus.SERVING));
+                    m.put("shards_gcing", s.shardsIn(ShardStatus.GCING));
+                    m.put("shards_pulling", s.shardsIn(ShardStatus.PULLING));
+                    m.put("shards_bepulling", s.shardsIn(ShardStatus.BEPULLING));
+                } else if (replica.stateMachine() instanceof ControllerStateMachine c) {
+                    m.put("config_num", c.latest().num());
+                }
+                result.complete(m);
+            } catch (RuntimeException e) {
+                result.completeExceptionally(e);
+            }
+        });
+        return result;
+    }
+
     private GroupStatus describe(GroupReplica replica) {
         RaftNode n = replica.node();
         int keys = 0;

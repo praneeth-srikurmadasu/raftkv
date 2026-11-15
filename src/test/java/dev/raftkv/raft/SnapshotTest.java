@@ -47,7 +47,10 @@ class SnapshotTest {
         c.awaitAppliedEverywhere(leader.commitIndex(), Duration.ofSeconds(30));
         for (NodeId id : c.ids) {
             RaftNode n = c.node(id);
-            assertThat(n.snapshotsTaken()).as("seed %d %s", seed, id).isGreaterThan(5L);
+            // How many snapshots a follower takes depends on how its commit index advances (with
+            // pipelining it may learn of 200 commits at once and snapshot once); what matters is
+            // that it snapshots and its log stays short.
+            assertThat(n.snapshotsTaken() + n.snapshotsInstalled()).as("seed %d %s", seed, id).isGreaterThan(0L);
             assertThat(c.log(id).snapshotIndex()).as("seed %d %s", seed, id).isGreaterThan(150L);
             assertThat(c.log(id).lastIndex() - c.log(id).snapshotIndex()).as("log stays short").isLessThan(60L);
             assertThat(applied(c, id)).as("seed %d", seed).isEqualTo(applied(c, leader.id()));

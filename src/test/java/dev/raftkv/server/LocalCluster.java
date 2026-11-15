@@ -38,6 +38,7 @@ public final class LocalCluster implements AutoCloseable {
     private final int groups;
     private final Map<NodeId, InetSocketAddress> addresses = new TreeMap<>();
     private final Map<NodeId, Node> nodes = new TreeMap<>();
+    private final RaftConfig config;
     private final ConcurrentLinkedQueue<Throwable> fatal = new ConcurrentLinkedQueue<>();
     private final ConcurrentLinkedQueue<String> events = new ConcurrentLinkedQueue<>();
     private final List<ClientHandle> clients = new ArrayList<>();
@@ -53,9 +54,9 @@ public final class LocalCluster implements AutoCloseable {
             transport = NioTransport.start(id, addresses.get(id), addresses, host);
             host.attach(transport);
             List<NodeId> servers = ids();
-            host.addControllerGroup(addresses.keySet(), SHARDS, RaftConfig.defaults());
+            host.addControllerGroup(addresses.keySet(), SHARDS, config);
             for (int gid = 1; gid <= groups; gid++) {
-                host.addShardGroup(gid, addresses.keySet(), SHARDS, servers, RaftConfig.defaults());
+                host.addShardGroup(gid, addresses.keySet(), SHARDS, servers, config);
             }
             bootstrap = new ClusterBootstrap(id, servers, groups, transport, host.router(), SystemClock.INSTANCE, events::add);
             bootstrap.start();
@@ -81,7 +82,13 @@ public final class LocalCluster implements AutoCloseable {
     }
 
     public LocalCluster(int size, int groups) {
+        this(size, groups, RaftConfig.defaults());
+    }
+
+    /** With a specific Raft configuration on every group (benchmarks compare settings). */
+    public LocalCluster(int size, int groups, RaftConfig config) {
         this.groups = groups;
+        this.config = config;
         root = RealNet.tempDir("raftkv-cluster");
         for (int i = 1; i <= size; i++) {
             addresses.put(NodeId.of(i), RealNet.freeLoopbackAddress());

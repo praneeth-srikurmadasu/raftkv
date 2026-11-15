@@ -30,7 +30,7 @@ public final class RandomMessages {
             case REQUEST_VOTE -> new RequestVote(edgeLong(r), node(r), edgeLong(r), edgeLong(r), r.nextBoolean(), r.nextBoolean());
             case REQUEST_VOTE_REPLY -> new RequestVoteReply(edgeLong(r), r.nextBoolean(), r.nextBoolean());
             case APPEND_ENTRIES -> appendEntries(r);
-            case APPEND_ENTRIES_REPLY -> new AppendEntriesReply(edgeLong(r), r.nextBoolean(), edgeLong(r), edgeLong(r), edgeLong(r));
+            case APPEND_ENTRIES_REPLY -> new AppendEntriesReply(edgeLong(r), r.nextBoolean(), edgeLong(r), edgeLong(r), edgeLong(r), edgeLong(r));
             case INSTALL_SNAPSHOT -> new InstallSnapshot(edgeLong(r), node(r), edgeLong(r), edgeLong(r), edgeLong(r), bytes(r, 512), r.nextBoolean());
             case INSTALL_SNAPSHOT_REPLY -> new InstallSnapshotReply(edgeLong(r), edgeLong(r), edgeLong(r), r.nextBoolean());
             case TIMEOUT_NOW -> new TimeoutNow(edgeLong(r), node(r));
@@ -80,7 +80,7 @@ public final class RandomMessages {
             Bytes data = type == EntryType.NOOP ? Bytes.EMPTY : bytes(r, 64);
             entries.add(new LogEntry(prevLogIndex + 1 + i, term, type, data));
         }
-        return new AppendEntries(edgeLong(r), node(r), prevLogIndex, edgeLong(r), entries, edgeLong(r));
+        return new AppendEntries(edgeLong(r), node(r), prevLogIndex, edgeLong(r), entries, edgeLong(r), edgeLong(r));
     }
 
     /** A non-negative long, often an edge value. */

@@ -33,9 +33,17 @@ import dev.raftkv.shard.Shards;
  * @param verbose also log the very frequent events (commits)
  * @param groups  number of data groups (ids 1..groups)
  * @param shards  number of shards
+ * @param voters  initial voters of every group (default: every peer). Peers outside it start as
+ *                spares: they host every group but only join one when an admin adds them.
+ * @param metricsPort port of the HTTP metrics endpoint and dashboard (default: listen port + 1000;
+ *                    0 = off)
  */
 public record NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSocketAddress listen,
-                         Path dataDir, boolean verbose, int groups, int shards) {
+                         Path dataDir, boolean verbose, int groups, int shards, java.util.SortedSet<NodeId> voters,
+                         int metricsPort) {
+
+    /** Metrics listen on the cluster port plus this, unless --metrics-port says otherwise. */
+    public static final int METRICS_PORT_OFFSET = 1000;
 
     public static final int DEFAULT_GROUPS = 3;
 
@@ -53,13 +61,41 @@ public record NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSo
             throw new IllegalArgumentException("--shards must be between 1 and 65536");
         }
         peers = Collections.unmodifiableMap(new TreeMap<>(peers));
+        voters = Collections.unmodifiableSortedSet(new java.util.TreeSet<>(voters));
+        if (voters.isEmpty() || !peers.keySet().containsAll(voters)) {
+            throw new IllegalArgumentException("--voters must be a non-empty subset of --peers");
+        }
+        if (metricsPort < 0 || metricsPort > 65535) {
+            throw new IllegalArgumentException("--metrics-port out of range: " + metricsPort);
+        }
+    }
+
+    public NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSocketAddress listen,
+                      Path dataDir, boolean verbose, int groups, int shards, java.util.SortedSet<NodeId> voters) {
+        this(id, peers, listen, dataDir, verbose, groups, shards, voters, defaultMetricsPort(listen.getPort()));
+    }
+
+    /** listen port + 1000, or off if that is not a valid port (e.g. listen port 0 in tests). */
+    public static int defaultMetricsPort(int listenPort) {
+        int p = listenPort + METRICS_PORT_OFFSET;
+        return listenPort == 0 || p > 65535 ? 0 : p;
+    }
+
+    /** Every peer is an initial voter. */
+    public NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSocketAddress listen,
+                      Path dataDir, boolean verbose, int groups, int shards) {
+        this(id, peers, listen, dataDir, verbose, groups, shards, new java.util.TreeSet<>(peers.keySet()),
+                defaultMetricsPort(listen.getPort()));
     }
 
     public static final String USAGE = """
-            usage: raftkv --id <n> --peers <id=host:port,...> [--groups <g>] [--shards <n>] [--data <dir>] [--listen <host:port>] [--verbose]
+            usage: raftkv --id <n> --peers <id=host:port,...> [--groups <g>] [--shards <n>] [--voters <id,...>] [--metrics-port <p>] [--data <dir>] [--listen <host:port>] [--verbose]
               --id       this node's id (a number listed in --peers)
               --peers    every cluster member including this one, e.g. 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
               --groups   number of data groups, each replicated on every peer (default: 3)
+              --voters   initial voters of every group (default: every peer); the other peers start
+                         as spares and join a group with 'admin add-server' in the CLI
+              --metrics-port  HTTP metrics + dashboard (default: listen port + 1000; 0 = off)
               --shards   number of shards; must never change for a cluster (default: 64)
               --data     data directory (default: data/n<id>)
               --listen   address to listen on (default: this node's address from --peers)
@@ -73,7 +109,7 @@ public record NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSo
             String a = args[i];
             switch (a) {
                 case "--verbose" -> verbose = true;
-                case "--id", "--peers", "--data", "--listen", "--groups", "--shards" -> {
+                case "--id", "--peers", "--data", "--listen", "--groups", "--shards", "--voters", "--metrics-port" -> {
                     if (i + 1 >= args.length) {
                         throw new IllegalArgumentException(a + " needs a value");
                     }
@@ -99,7 +135,18 @@ public record NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSo
         Path data = Path.of(opts.getOrDefault("--data", "data/n" + id.value()));
         int groups = opts.containsKey("--groups") ? parseInt(opts.get("--groups"), "--groups") : DEFAULT_GROUPS;
         int shards = opts.containsKey("--shards") ? parseInt(opts.get("--shards"), "--shards") : Shards.DEFAULT_COUNT;
-        return new NodeConfig(id, peers, listen, data, verbose, groups, shards);
+        java.util.SortedSet<NodeId> voters = new java.util.TreeSet<>(peers.keySet());
+        if (opts.containsKey("--voters")) {
+            voters.clear();
+            for (String v : opts.get("--voters").split(",")) {
+                if (!v.isBlank()) {
+                    voters.add(new NodeId(parseInt(v.trim(), "--voters id")));
+                }
+            }
+        }
+        int metrics = opts.containsKey("--metrics-port") ? parseInt(opts.get("--metrics-port"), "--metrics-port")
+                : defaultMetricsPort(listen.getPort());
+        return new NodeConfig(id, peers, listen, data, verbose, groups, shards, voters, metrics);
     }
 
     /** Parses {@code 1=host:port,2=host:port}. */

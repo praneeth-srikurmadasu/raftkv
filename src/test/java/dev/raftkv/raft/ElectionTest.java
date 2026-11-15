@@ -94,8 +94,10 @@ class ElectionTest {
         List<NodeId> majority = c.ids.stream().filter(id -> !id.equals(old.id())).toList();
         RaftNode replacement = c.awaitLeader(majority, Duration.ofSeconds(3));
         assertThat(replacement.currentTerm()).as("seed %d", seed).isGreaterThan(old.currentTerm());
-        // Without check-quorum (Milestone 11), the cut-off leader still believes it leads its old term.
-        assertThat(old.role()).as("seed %d", seed).isEqualTo(Role.LEADER);
+        // Check-quorum: within an election timeout of losing its majority, the cut-off leader
+        // steps down on its own, even before it learns about the new term.
+        c.run(Duration.ofMillis(400));
+        assertThat(old.role()).as("seed %d", seed).isNotEqualTo(Role.LEADER);
 
         c.net.heal();
         RaftNode leader = c.awaitLeader(Duration.ofSeconds(2));
@@ -129,23 +131,39 @@ class ElectionTest {
 
     @Test
     void rejoiningNodeWithHighTermDoesNotDisruptAHealthyLeader() {
+        // Without pre-vote: the loner inflates its term; stickiness protects the followers, but the
+        // leader learns the higher term from the loner's replies and steps down once.
         long seed = Seeds.resolve();
-        SimulatedCluster c = new SimulatedCluster(seed, 5, CONFIG);
+        SimulatedCluster c = new SimulatedCluster(seed, 5, CONFIG.withElectionExtensions(false, true));
         c.startAll();
         RaftNode leader = c.awaitLeader(Duration.ofSeconds(2));
         NodeId loner = c.ids.stream().filter(id -> !id.equals(leader.id())).findFirst().orElseThrow();
         c.net.isolate(loner);
         c.run(Duration.ofSeconds(5)); // the loner times out again and again, inflating its term
         assertThat(c.node(loner).currentTerm()).as("seed %d", seed).isGreaterThan(leader.currentTerm() + 5);
-
         c.net.heal();
         c.run(Duration.ofSeconds(3));
-        // Leader stickiness: the others reject the loner's RequestVotes without adopting its term.
-        // (The leader itself does learn the higher term from the loner's replies to heartbeats and
-        // steps down once; full protection needs pre-vote, Milestone 11.) Safety holds either way,
-        // and the group always converges again.
         RaftNode after = c.awaitLeader(Duration.ofSeconds(3));
         assertThat(after.currentTerm()).as("seed %d", seed).isGreaterThanOrEqualTo(leader.currentTerm());
+    }
+
+    /** Thesis §9.6: with pre-vote, a node cut off from the others never raises its term, so it can't disturb anyone. */
+    @Test
+    void withPreVoteARejoiningNodeChangesNothing() {
+        long seed = Seeds.resolve();
+        SimulatedCluster c = new SimulatedCluster(seed, 5, CONFIG);
+        c.startAll();
+        RaftNode leader = c.awaitLeader(Duration.ofSeconds(2));
+        long term = leader.currentTerm();
+        NodeId loner = c.ids.stream().filter(id -> !id.equals(leader.id())).findFirst().orElseThrow();
+        c.net.isolate(loner);
+        c.run(Duration.ofSeconds(5));
+        assertThat(c.node(loner).currentTerm()).as("seed %d", seed).isEqualTo(term);
+        assertThat(c.node(loner).preVotesStarted()).as("seed %d", seed).isGreaterThan(5L);
+        c.net.heal();
+        c.run(Duration.ofSeconds(3));
+        assertThat(leader.role()).as("seed %d", seed).isEqualTo(Role.LEADER);
+        assertThat(leader.currentTerm()).as("seed %d", seed).isEqualTo(term);
     }
 
     /** §5.4.1: a node missing entries that a majority has can never become leader. */

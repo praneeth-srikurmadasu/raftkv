@@ -91,8 +91,21 @@ final class LinearizabilityChaos {
     }
 
     static Result run(long seed, RaftConfig config, SimulatedCluster.Storage storage) {
+        return run(seed, config, storage, false);
+    }
+
+    /**
+     * @param membershipChurn Milestone 12: 5 servers, the group starts with voters {1,2,3}, and an
+     *                        admin keeps adding and removing servers (between 3 and 5 voters) while
+     *                        everything else goes on
+     */
+    static Result run(long seed, RaftConfig config, SimulatedCluster.Storage storage, boolean membershipChurn) {
         Random r = new Random(seed);
-        SimulatedCluster c = SimulatedCluster.kv(seed, r.nextBoolean() ? 3 : 5, SnapshotSwarm.pick(seed, config), storage);
+        SimulatedCluster c = SimulatedCluster.kv(seed, membershipChurn || r.nextBoolean() ? (membershipChurn ? 5 : 3) : 5,
+                SnapshotSwarm.pick(seed, config), storage);
+        if (membershipChurn) {
+            c.setBootstrapVoters(c.ids.subList(0, 3));
+        }
         History history = new History(c.sim::now);
         try {
             // ---- swarm: which faults are on in this run
@@ -131,6 +144,8 @@ final class LinearizabilityChaos {
                     if (!a.equals(b)) {
                         c.net.blockOneWay(a, b);
                     }
+                } else if (membershipChurn && pick >= 7) {
+                    churn(c, nemesis);
                 } else if (spikes && pick == 1) {
                     c.net.setLatency(Duration.ofMillis(1), Duration.ofMillis(nemesis.nextBoolean() ? 150 : maxLatency));
                 } else {
@@ -146,7 +161,16 @@ final class LinearizabilityChaos {
             c.net.setDuplicateRate(0);
             c.net.setLatency(Duration.ofMillis(1), Duration.ofMillis(maxLatency));
             c.sim.runUntil(() -> workers.stream().allMatch(w -> w.inFlight.isDone()), Duration.ofSeconds(60));
-            c.awaitLeader(Duration.ofSeconds(10));
+            if (membershipChurn) {
+                // Removed servers may still believe in an old membership; ask the current voters.
+                boolean leader = c.sim.runUntil(() -> c.runningNodes().stream()
+                        .anyMatch(n -> n.role() == Role.LEADER && n.voters().contains(n.id())), Duration.ofSeconds(10));
+                if (!leader) {
+                    throw new AssertionError("no leader after recovery: " + c.runningNodes());
+                }
+            } else {
+                c.awaitLeader(Duration.ofSeconds(10));
+            }
 
             List<Operation> ops = history.operations();
             int unknown = (int) ops.stream().filter(Operation::isUnknown).count();
@@ -160,6 +184,25 @@ final class LinearizabilityChaos {
         } catch (AssertionError | SimulationException | IllegalStateException e) {
             String message = e.getMessage() + (e.getCause() != null ? " / cause: " + e.getCause().getMessage() : "");
             return new Result(seed, Optional.of(message), history.size(), 0, false);
+        }
+    }
+
+    /** One admin step: grow towards 5 voters or shrink towards 3, through whoever leads now. */
+    private static void churn(SimulatedCluster c, Random nemesis) {
+        Optional<RaftNode> leader = c.runningNodes().stream().filter(n -> n.role() == Role.LEADER)
+                .max(java.util.Comparator.comparingLong(RaftNode::currentTerm));
+        if (leader.isEmpty()) {
+            return;
+        }
+        RaftNode l = leader.get();
+        java.util.Set<NodeId> voters = l.voters();
+        boolean grow = voters.size() < 5 && (voters.size() == 3 || nemesis.nextBoolean());
+        if (grow) {
+            List<NodeId> outside = c.ids.stream().filter(id -> !voters.contains(id)).toList();
+            l.addServer(outside.get(nemesis.nextInt(outside.size())));
+        } else if (voters.size() > 3) {
+            List<NodeId> inside = List.copyOf(voters);
+            l.removeServer(inside.get(nemesis.nextInt(inside.size())));
         }
     }
 

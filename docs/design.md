@@ -162,8 +162,39 @@ This document grows with every milestone. It records **what** we built, **why** 
 | Sessions | Per shard, migrated with the data | Global per group | Exactly-once survives a key moving between groups mid-retry. |
 | Ownership check | On arrival (cheap rejection) and again at apply (decisive) | Arrival only | A ConfigChange can land between arrival and commit. |
 
-### Known limitation (until Milestone 11)
-A node that misses heartbeats (briefly partitioned) can time out right after it reconnects; its higher term then makes the healthy leader step down through Fig. 2's "higher term → follower" rule. Safety is unaffected, but it costs an election. Pre-vote removes this. The chaos test lets the group settle for 2 s after healing before checking stability.
+### Key decisions (Milestone 11)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Read modes | LOG, READ_INDEX (default), LEASE, per group (`RaftConfig.readMode`) | One fixed mode | SPEC asks to implement and benchmark all three; LEASE adds a clock assumption, so it is opt-in. |
+| Leadership confirmation | A heartbeat round number in every AppendEntries, echoed in replies | Correlation ids per read; a separate RPC | One field; any reply of the current term counts; concurrent reads share a round. |
+| Lease length | `electionTimeoutMin / (1 + maxClockDrift)` from the confirmed round's send time; dropped during leadership transfer | From the reply time | Send time is the conservative end; transfer bypasses stickiness. |
+| Pre-vote | On by default; a pre-vote request changes nothing on the voter | Off | Stops cut-off nodes from inflating terms and deposing healthy leaders. |
+| Check-quorum | On by default; checked every minimum election timeout | Off | Deposed leaders step down by themselves; makes leases safe in practice. |
+| Pipelining | Window of 8 batches per follower; progress-only sends; go-back-N after a silent heartbeat; one go-back per gap | Unbounded; optimistic nextIndex | Bounded, cannot amplify messages (each send is caused by progress or a timer). |
+| Follower group commit | Success replies wait for the next flush; one fsync covers every AppendEntries before it | fsync per message | Doubled write throughput; made pipelining pay off (docs/benchmarks.md). |
+| Read bugs | Scripted windows judged by the linearizability checker | Chaos only | Check-quorum and stickiness close most of the window; random faults rarely hit it. |
+
+### Key decisions (Milestone 12)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Change protocol | Single-server changes; a configuration takes effect when appended, reverts if truncated | Joint consensus | Simpler; the thesis' recommended approach. |
+| Safety fix | A change waits (not refused) until an entry of the leader's term and the previous change have committed | Refuse | Callers needn't retry; the rule still holds. |
+| New servers | Learner first, promoted once caught up to the commit index | Voter immediately | A voter with an empty log would stall commits. |
+| Removed servers | Excluded from majorities at once, but kept receiving entries until the removal commits | Dropped at once | They learn they are out and stop campaigning. |
+| Snapshots | Carry the membership at their index (prefix in the snapshot bytes) | Separate metadata file | No format change in stores or InstallSnapshot. |
+| Admin path | Admin commands ride on ClientRequest with a reserved tag, answered by the replica | New message types | No protocol change; works through every router and transport. |
+| Spares | `--voters` sets initial membership; other peers host every group as learners | Dynamic process join | Peers' addresses must be known to the transport anyway. |
+
+### Key decisions (Milestone 13)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Metrics | JDK HttpServer: Prometheus text, JSON, dashboard page; values read on each group's loop | JMX, Micrometer | No dependencies; scrapeable; thread-safe by construction. |
+| Dashboard | One static page polling every node's /status.json (CORS) | Server-side aggregation | Shows each node's own view; works with nodes down. |
+| Jepsen-lite | Java program + short JUnit run; same checker as the simulations | Real Jepsen (Clojure) | Same language, same checker, runs in CI. |
+| Coverage | JaCoCo in an opt-in Maven profile, nightly | Always on | Keeps the normal build fast and dependency-free. |
 
 ## 4. Deviations from SPEC.md
 
@@ -178,11 +209,16 @@ A node that misses heartbeats (briefly partitioned) can time out right after it 
 9. **One listening port.** SPEC §5.2 suggests separate ports for peer and client RPCs. One port serves both; the handshake's node id tells them apart. A second port can be added when there's a reason (e.g. firewalling clients from peers).
 10. **No correlation-id request futures in the transport.** SPEC §5.2 describes request/response matching by correlation id inside the transport. The transport is one-way messaging; `RaftKVClient` already matches replies by sequence number and has its own timeouts, so frames carry correlation id 0.
 11. **Back-pressure drops instead of replying `OVERLOADED`.** Per-connection write queues are bounded (64 MiB), but a full queue drops frames rather than surfacing `OVERLOADED` to clients. Admission control comes with the performance work (Milestone 11).
-12. **fsync on the group's event loop.** SPEC §3.2 prefers slow work off the event loop. The log's group-commit flush runs on the group's own thread; with one group per process this costs nothing measurable. Moving fsync to a dedicated thread is part of Milestone 11.
+12. **fsync on the group's event loop.** SPEC §3.2 prefers slow work off the event loop. The group-commit flush (leader and, since Milestone 11, follower) runs on the group's own thread, batching every append made before it. A dedicated I/O thread per group would let the loop keep working during the fsync; not done yet.
 13. **Coalesced heartbeats** (SPEC §5.2 stretch goal) are deferred. With 4 groups per process the extra heartbeats are negligible; they matter at hundreds of groups.
-14. **Snapshots serialize on the event loop.** SPEC §3.8 asks for a copy-on-write capture and background serialization. The group pauses while its state is copied (milliseconds for megabytes). Background snapshots come with the Milestone 11 performance work.
+14. **Snapshots serialize on the event loop.** SPEC §3.8 asks for a copy-on-write capture and background serialization. The group pauses while its state is copied (milliseconds for megabytes). Not done yet.
 15. **Incoming snapshot chunks are buffered in memory**, then saved with the same crash-safe write as local snapshots, instead of being appended to a temp file chunk by chunk. Memory is bounded by one snapshot.
-16. **Controller Query goes through the log.** SPEC §6.3 says ReadIndex; ReadIndex arrives in Milestone 11. Going through the log is also linearizable, just slower.
+16. **Controller Query goes through the log.** SPEC §6.3 says ReadIndex. ReadIndex exists since Milestone 11 and serves KV GETs, but the controller's Query still goes through the log: correct, slower, and it makes the controller's log grow with every config poll (compacted by snapshots).
 17. **Rebalancer tie rule** differs from SPEC §6.3: the extra shards go to the groups that currently hold the most (lowest gid on ties) rather than always to the lowest gids, because that is what guarantees the minimum number of moves (see Milestone 9 decisions).
 18. **Real processes host every data group.** `Main` runs a replica of the controller and of each of `--groups` data groups on every process; `admin join` can only (re)add groups that the processes host. Groups on separate machine sets are exercised in the simulator. Placing groups on subsets of processes (and SPEC §9.7's 9-JVM Jepsen-lite) is part of Milestone 13.
 19. **Sharded gate is 2,000 seeds per build.** Matches SPEC §11; larger runs are done by hand with `-Draftkv.seeds` (2,500 seeds: 1.4M operations, 20,233 reconfigurations, all linearizable).
+20. **Read-bug detection is scripted.** SPEC §9.6 expects chaos to catch `READINDEX_WITHOUT_HEARTBEAT` and `LEASE_WITHOUT_STICKINESS`. Check-quorum and stickiness shrink the window in which they do harm so much that 300 chaos seeds caught neither; scripted scenarios drive the system into that window and the linearizability checker judges (ReadBugDetectionTest). `RESET_TIMER_ON_REJECTED_VOTE` is caught by a scripted liveness test.
+21. **Membership chaos runs on the single-group store.** SPEC §11 asks for 3→5→3 in a data group while shards migrate. The churn chaos test (`MembershipChaosTest`) uses the single-group KV store; the sharded path uses the same RaftNode code per group, and the CLI changes any group's membership, but no chaos test combines membership churn with migration yet.
+22. **Controller configurations list each group's original servers.** After `admin add-server`, a group's new member isn't in the controller's server list; clients reach it by following NOT_LEADER hints (it must be in their `--servers`).
+23. **Benchmarks are partial.** Implemented: pipelining on/off, read modes, failover with/without pre-vote, catch-up with/without snapshots, groups 1/2/4 on one machine. Not yet: open-loop latency curves, migration impact, multi-Raft overhead, JMH micro-benchmarks (docs/benchmarks.md).
+24. **Coverage is reported, not enforced.** SPEC §9.9 targets ≥ 85% line coverage on raft/, kv/, shard/; the nightly job publishes the JaCoCo report but doesn't fail below a threshold.

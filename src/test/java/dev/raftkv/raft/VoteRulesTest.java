@@ -31,6 +31,9 @@ import org.junit.jupiter.api.Test;
  */
 class VoteRulesTest {
 
+    /** These tests drive Figure 2's election rules message by message: no pre-vote, no check-quorum. */
+    private static final RaftConfig CLASSIC = RaftConfig.defaults().withElectionExtensions(false, false);
+
     private static final NodeId ME = NodeId.of(1);
     private static final NodeId A = NodeId.of(2);
     private static final NodeId B = NodeId.of(3);
@@ -58,7 +61,7 @@ class VoteRulesTest {
                 sent.add(new Sent(to, message, meta.load()));
             }
         };
-        node = RaftNode.builder().self(ME).group(G).voters(Set.of(ME, A, B)).config(RaftConfig.defaults())
+        node = RaftNode.builder().self(ME).group(G).voters(Set.of(ME, A, B)).config(CLASSIC)
                 .scheduler(sim).clock(sim.clock()).random(new Random(1)).transport(capture)
                 .log(new InMemoryLog(List.of(LogEntry.noop(1, 2), LogEntry.noop(2, 4)))).metaStore(meta).build();
         node.start(); // our log: [1@t2, 2@t4], currentTerm 5
@@ -147,7 +150,7 @@ class VoteRulesTest {
     void restartRemembersTheVote() {
         assertThat(vote(A, 6, 2, 4).voteGranted()).isTrue();
         node.stop();
-        RaftNode restarted = RaftNode.builder().self(ME).group(G).voters(Set.of(ME, A, B)).config(RaftConfig.defaults())
+        RaftNode restarted = RaftNode.builder().self(ME).group(G).voters(Set.of(ME, A, B)).config(CLASSIC)
                 .scheduler(sim).clock(sim.clock()).random(new Random(2)).transport(captureFor())
                 .log(new InMemoryLog(List.of(LogEntry.noop(1, 2), LogEntry.noop(2, 4)))).metaStore(meta).build();
         restarted.start();

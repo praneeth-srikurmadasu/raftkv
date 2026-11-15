@@ -36,7 +36,10 @@ final class GcScenario {
     }
 
     static Optional<String> run(long seed, RaftConfig config) {
-        ShardedCluster c = new ShardedCluster(seed, 2, 6, config, ShardedCluster.Storage.MEMORY, false);
+        // Step 2 needs a leader that keeps leading without its followers long enough to fetch and
+        // propose: check-quorum would (rightly) make it step down first, so it is off here.
+        RaftConfig scripted = config.withElectionExtensions(config.preVote(), false);
+        ShardedCluster c = new ShardedCluster(seed, 2, 6, scripted, ShardedCluster.Storage.MEMORY, false);
         c.net.setLatency(Duration.ofMillis(1), Duration.ofMillis(3));
         c.startAll();
         ClientConfig cc = new ClientConfig(Duration.ofMillis(200), Duration.ofMillis(10), Duration.ofMillis(200),

@@ -4,5 +4,6 @@
 #   scripts/cli.sh put color blue   one command
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
+load_settings
 cd "$ROOT"
-exec java -cp target/classes dev.raftkv.client.cli.RaftKVCli --servers "$(peers "${NODES:-3}" "${BASE_PORT:-7001}")" "$@"
+exec java -cp target/classes dev.raftkv.client.cli.RaftKVCli --servers "$(peers "$TOTAL" "$BASE_PORT")" "$@"

@@ -32,6 +32,14 @@ import org.junit.jupiter.api.Test;
  */
 class Figure8Test {
 
+    /**
+     * The scripted Figure 8 history forces elections at exact moments: classic Raft elections
+     * (no pre-vote, which would ask permission first; no check-quorum, which would depose the
+     * scripted leaders early), and stop-and-wait replication, so each scripted step replicates
+     * exactly what the script expects. The safety rule under test does not depend on any of these.
+     */
+    static final RaftConfig CLASSIC = RaftConfig.defaults().withElectionExtensions(false, false).withMaxInflightAppends(1);
+
     private static final NodeId S1 = NodeId.of(1);
     private static final NodeId S2 = NodeId.of(2);
     private static final NodeId S3 = NodeId.of(3);
@@ -84,7 +92,7 @@ class Figure8Test {
     @Test
     void correctLeaderDoesNotCommitAnEarlierTermEntryByCounting() {
         for (long seed = 1; seed <= 20; seed++) {
-            SimulatedCluster c = play(seed, RaftConfig.defaults());
+            SimulatedCluster c = play(seed, CLASSIC);
             // Everyone ends up with y3 at index 2 (S5's entry won), and applied it.
             for (NodeId id : c.ids) {
                 assertThat(c.log(id).entryAt(2).data()).as("seed %d %s", seed, id).isEqualTo(Bytes.ofUtf8("y3"));
@@ -97,7 +105,7 @@ class Figure8Test {
     void theBugIsCaughtWhenCountingReplicasOfOldEntries() {
         // With the bug, the term-4 leader commits and APPLIES y2 at index 2; later S5's group
         // applies y3 at index 2. State Machine Safety (or "committed entry changed") fires.
-        assertThatThrownBy(() -> play(1, RaftConfig.defaults().withBugs(Bug.COMMIT_PREVIOUS_TERM_BY_COUNT)))
+        assertThatThrownBy(() -> play(1, CLASSIC.withBugs(Bug.COMMIT_PREVIOUS_TERM_BY_COUNT)))
                 .isInstanceOf(SimulationException.class)
                 .hasMessageContaining("seed=1");
     }

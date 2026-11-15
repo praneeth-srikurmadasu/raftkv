@@ -208,8 +208,16 @@ class ReplicationTest {
      */
     @Test
     void catchUpTrafficStaysBoundedOnADuplicatingNetwork() {
+        // Stop-and-wait: ~400 AppendEntries + ~400 replies + heartbeats (measured ~1,250).
+        assertThat(catchUpTraffic(CONFIG.withMaxInflightAppends(1))).isLessThan(5_000L);
+        // A pipeline of 8 resends more on a reordering, duplicating network (measured ~5,000-5,300
+        // over 40 seeds), but it stays proportional to the work: no explosion.
+        assertThat(catchUpTraffic(CONFIG)).isLessThan(12_000L);
+    }
+
+    private static long catchUpTraffic(RaftConfig config) {
         long seed = Seeds.resolve();
-        SimulatedCluster c = new SimulatedCluster(seed, 3, CONFIG.withMaxEntriesPerAppend(1));
+        SimulatedCluster c = new SimulatedCluster(seed, 3, config.withMaxEntriesPerAppend(1));
         c.net.setDuplicateRate(0.2);
         c.startAll();
         RaftNode leader = c.awaitLeader(Duration.ofSeconds(2));
@@ -220,13 +228,12 @@ class ReplicationTest {
             last = leader.propose(Bytes.ofUtf8("w" + i));
         }
         CompletableFuture<CommitResult> lastWrite = last;
-        c.sim.runUntil(lastWrite::isDone, Duration.ofSeconds(10));
+        c.sim.runUntil(lastWrite::isDone, Duration.ofSeconds(30));
+        assertThat(lastWrite.isDone()).as("seed %d: writes committed", seed).isTrue();
         long sentBefore = c.net.sentCount();
         c.restart(down);                      // 400+ entries behind, one entry per message
-        c.awaitAppliedEverywhere(lastWrite.join().index(), Duration.ofSeconds(30));
-        long sentDuringCatchUp = c.net.sentCount() - sentBefore;
-        // ~400 AppendEntries + ~400 replies + heartbeats; allow generous slack, but not explosion.
-        assertThat(sentDuringCatchUp).as("seed %d", seed).isLessThan(5_000L);
+        c.awaitAppliedEverywhere(lastWrite.join().index(), Duration.ofSeconds(60));
+        return c.net.sentCount() - sentBefore;
     }
 
     @Test

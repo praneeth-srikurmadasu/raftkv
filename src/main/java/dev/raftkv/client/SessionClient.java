@@ -73,6 +73,8 @@ public final class SessionClient {
         int attempts;
         Cancellable timer;
 
+        boolean readOnly;
+
         Pending(long sequence, Bytes command, Bytes routingKey, long deadlineNanos) {
             this.sequence = sequence;
             this.command = command;
@@ -98,11 +100,21 @@ public final class SessionClient {
      * {@link SessionExpiredException}, or {@link IllegalArgumentException} (the server rejected it).
      */
     public CompletableFuture<Bytes> submit(Bytes command, Bytes routingKey) {
+        return submit(command, routingKey, false);
+    }
+
+    /**
+     * As {@link #submit(Bytes, Bytes)}; {@code readOnly} marks a request a server may answer without
+     * a log entry (a GET under ReadIndex or lease reads). Its reply doesn't prove that the server
+     * holds a session for us, so it doesn't let the watermark rise above 1 (see {@link #ackedBelow}).
+     */
+    public CompletableFuture<Bytes> submit(Bytes command, Bytes routingKey, boolean readOnly) {
         Objects.requireNonNull(command, "command");
         Objects.requireNonNull(routingKey, "routingKey");
         CompletableFuture<Bytes> result = new CompletableFuture<>();
         scheduler.execute(() -> {
             Pending p = new Pending(nextSequence++, command, routingKey, clock.nanos() + config.deadline().toNanos());
+            p.readOnly = readOnly;
             outstanding.put(p.sequence, p);
             p.future.whenComplete((r, e) -> {
                 if (e != null) {
@@ -152,7 +164,8 @@ public final class SessionClient {
      * request may already have run) and refuses it. If our first requests timed out without ever
      * reaching a server, the watermark would already be above 1 and every later request would be
      * refused forever. (Found by the sharded chaos test: a config poller whose first queries were
-     * lost in a partition could never talk to the controller again.)
+     * lost in a partition could never talk to the controller again.) Replies to reads served
+     * without the log (ReadIndex, leases) don't count: they create no session on the server.
      */
     private long ackedBelow() {
         if (!sessionKnown) {
@@ -219,7 +232,9 @@ public final class SessionClient {
         GroupId group = envelope.group();
         switch (reply.status()) {
             case OK -> {
-                sessionKnown = true;
+                if (!p.readOnly) {
+                    sessionKnown = true; // a write ran through the log, so the server has our session
+                }
                 leaders.put(group, envelope.from());
                 finish(p);
                 p.future.complete(reply.result());

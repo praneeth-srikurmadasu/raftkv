@@ -14,6 +14,7 @@ import dev.raftkv.config.ClusterBootstrap;
 import dev.raftkv.config.NodeConfig;
 import dev.raftkv.io.RealDisk;
 import dev.raftkv.raft.RaftConfig;
+import dev.raftkv.server.MetricsServer;
 import dev.raftkv.server.RaftHost;
 import dev.raftkv.transport.NioTransport;
 
@@ -95,22 +96,45 @@ public final class Main {
             log.trace(banner());
             log.trace(config.id() + " listening on " + transport.localAddress() + ", data in "
                     + config.dataDir().toAbsolutePath() + ", cluster " + config.peers().keySet()
-                    + ", " + config.groups() + " data groups, " + config.shards() + " shards");
-            Set<NodeId> voters = config.peers().keySet();
+                    + ", " + config.groups() + " data groups, " + config.shards() + " shards"
+                    + (config.voters().contains(config.id()) ? "" : ", starting as a spare (not a voter yet)"));
+            Set<NodeId> voters = config.voters();
             List<NodeId> servers = List.copyOf(voters);
             RaftConfig raft = RaftConfig.defaults();
             host.addControllerGroup(voters, config.shards(), raft);
             for (int gid = 1; gid <= config.groups(); gid++) {
                 host.addShardGroup(gid, voters, config.shards(), servers, raft);
             }
-            try (ClusterBootstrap bootstrap = new ClusterBootstrap(config.id(), servers, config.groups(), transport,
+            try (MetricsServer metrics = startMetrics(config, host, transport, log); // null when off: skipped
+                 ClusterBootstrap bootstrap = new ClusterBootstrap(config.id(), servers, config.groups(), transport,
                     host.router(), SystemClock.INSTANCE, log)) {
+                if (metrics != null) {
+                    log.trace(config.id() + " dashboard and metrics on http://" + config.listen().getHostString() + ":"
+                            + metrics.address().getPort() + "/  (plain text: /metrics)");
+                }
                 bootstrap.start();
                 shutdownRequested.await();
             }
             log.trace(config.id() + " shutting down");
         } finally {
             closed.countDown();
+        }
+    }
+
+    /** The metrics endpoint and dashboard; a port that's taken only costs the metrics, never the node. */
+    private static MetricsServer startMetrics(NodeConfig config, RaftHost host, NioTransport transport, Tracer log) {
+        if (config.metricsPort() == 0) {
+            return null;
+        }
+        List<String> urls = config.peers().values().stream()
+                .map(a -> "http://" + a.getHostString() + ":" + NodeConfig.defaultMetricsPort(a.getPort()))
+                .toList();
+        try {
+            return MetricsServer.start(host, transport,
+                    new java.net.InetSocketAddress(config.listen().getAddress(), config.metricsPort()), urls);
+        } catch (java.io.IOException | RuntimeException e) {
+            log.trace(config.id() + " metrics disabled: cannot listen on port " + config.metricsPort() + " (" + e.getMessage() + ")");
+            return null;
         }
     }
 

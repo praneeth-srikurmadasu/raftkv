@@ -87,6 +87,6 @@ public final class RaftKVClient implements KVClient {
 
     private CompletableFuture<KVResult> submit(KVCommand command) {
         Bytes encoded = KVCodec.encode(command); // validates sizes on the caller's thread
-        return session.submit(encoded, command.key()).thenApply(KVCodec::decodeResult);
+        return session.submit(encoded, command.key(), command instanceof KVCommand.Get).thenApply(KVCodec::decodeResult);
     }
 }

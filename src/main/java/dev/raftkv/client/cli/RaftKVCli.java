@@ -20,9 +20,11 @@ import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
+import dev.raftkv.client.AdminClient;
 import dev.raftkv.client.ClientConfig;
 import dev.raftkv.common.Bytes;
 import dev.raftkv.common.EventLoopScheduler;
+import dev.raftkv.common.GroupId;
 import dev.raftkv.common.NodeId;
 import dev.raftkv.common.SystemClock;
 import dev.raftkv.config.NodeConfig;
@@ -62,6 +64,10 @@ public final class RaftKVCli implements AutoCloseable {
               admin join <gid> <id,id,...>   give group <gid> (one the servers were started with, see --groups)
                                              back its share of shards; ids = the servers hosting it
               admin leave <gid>              remove a group; its shards move to the others
+              admin add-server <gid> <id>    add server <id> to group <gid>'s Raft membership (learner, then voter)
+              admin remove-server <gid> <id> remove server <id> from group <gid>'s Raft membership
+              admin transfer-leader <gid> <id>  make server <id> the leader of group <gid>
+              status                         every server's view of every group (role, term, commit, membership)
               admin move <shard> <gid>       move one shard to a group
               help                           this text
               quit                           exit""";
@@ -74,6 +80,7 @@ public final class RaftKVCli implements AutoCloseable {
     private static final int CLIENT_ID_BASE = 1 << 24;
 
     private final ShardedKVClient client;
+    private final AdminClient adminClient;
     private final Set<NodeId> servers;
     private final NioTransport transport;
     private final EventLoopScheduler loop;
@@ -83,7 +90,13 @@ public final class RaftKVCli implements AutoCloseable {
         NodeId me = new NodeId(CLIENT_ID_BASE + new SecureRandom().nextInt(Integer.MAX_VALUE - CLIENT_ID_BASE));
         loop = new EventLoopScheduler("raftkv-cli");
         ShardedKVClient[] holder = new ShardedKVClient[1];
-        transport = NioTransport.client(me, servers, envelope -> holder[0].onMessage(envelope));
+        AdminClient[] admins = new AdminClient[1];
+        transport = NioTransport.client(me, servers, envelope -> {
+            holder[0].onMessage(envelope);  // each client ignores replies addressed to the other
+            admins[0].onMessage(envelope);
+        });
+        admins[0] = new AdminClient(transport, loop, SystemClock.INSTANCE, new ArrayList<>(servers.keySet()));
+        adminClient = admins[0];
         ClientConfig defaults = ClientConfig.defaults();
         holder[0] = new ShardedKVClient(transport, loop, SystemClock.INSTANCE, new SecureRandom(),
                 new ArrayList<>(servers.keySet()),
@@ -139,7 +152,7 @@ public final class RaftKVCli implements AutoCloseable {
             if (line == null) {
                 return;
             }
-            List<String> words = Arrays.stream(line.trim().split("\\s+")).filter(w -> !w.isEmpty()).toList();
+            List<String> words = Arrays.stream(clean(line).split("\\s+")).filter(w -> !w.isEmpty()).toList();
             if (words.isEmpty()) {
                 continue;
             }
@@ -148,6 +161,23 @@ public final class RaftKVCli implements AutoCloseable {
             }
             run(words, out);
         }
+    }
+
+    /**
+     * Makes pasted examples work: drops a leading {@code raftkv>} prompt (even several) and a
+     * trailing {@code # comment}.
+     */
+    static String clean(String line) {
+        String s = line;
+        int hash = s.indexOf('#');
+        if (hash >= 0) {
+            s = s.substring(0, hash);
+        }
+        s = s.trim();
+        while (s.startsWith("raftkv>")) {
+            s = s.substring("raftkv>".length()).trim();
+        }
+        return s;
     }
 
     /** Runs one command, printing the result; returns false if it failed. */
@@ -194,6 +224,7 @@ public final class RaftKVCli implements AutoCloseable {
                 case "admin" -> {
                     return admin(words, out);
                 }
+                case "status" -> status(out);
                 case "help" -> out.println(HELP);
                 default -> {
                     out.println("unknown command '" + cmd + "'; type 'help'");
@@ -211,9 +242,47 @@ public final class RaftKVCli implements AutoCloseable {
         }
     }
 
+    /** Asks every server for its replica's status in every group (group 0 is the controller). */
+    private void status(PrintStream out) {
+        List<Integer> gids = new ArrayList<>();
+        gids.add(0);
+        try {
+            gids.addAll(latestConfig().gids());
+        } catch (CompletionException e) {
+            out.println("(controller unreachable: showing group 0 only)");
+        }
+        for (int gid : gids) {
+            List<CompletableFuture<String>> lines = new ArrayList<>();
+            for (NodeId server : new TreeSet<>(servers)) {
+                lines.add(adminClient.status(GroupId.of(gid), server, Duration.ofSeconds(1))
+                        .exceptionally(e -> "g" + gid + " " + server + " unreachable"));
+            }
+            for (CompletableFuture<String> line : lines) {
+                out.println(line.join());
+            }
+        }
+    }
+
     private boolean admin(List<String> words, PrintStream out) {
         need(words, 2);
-        CompletableFuture<ShardConfig> result = switch (words.get(1).toLowerCase(Locale.ROOT)) {
+        String sub = words.get(1).toLowerCase(Locale.ROOT);
+        if (sub.equals("add-server") || sub.equals("remove-server") || sub.equals("transfer-leader")) {
+            need(words, 4);
+            GroupId g = GroupId.of(parseInt(words.get(2), "gid"));
+            NodeId id = new NodeId(parseInt(words.get(3).trim().replaceFirst("^n", ""), "server id"));
+            if (!servers.contains(id)) {
+                throw new IllegalArgumentException("server " + id + " is not one of --servers " + new TreeSet<>(servers));
+            }
+            Duration d = Duration.ofSeconds(30);
+            CompletableFuture<String> r = switch (sub) {
+                case "add-server" -> adminClient.addServer(g, id, d);
+                case "remove-server" -> adminClient.removeServer(g, id, d);
+                default -> adminClient.transferLeadership(g, id, d);
+            };
+            out.println(r.join());
+            return true;
+        }
+        CompletableFuture<ShardConfig> result = switch (sub) {
             case "join" -> {
                 need(words, 4);
                 List<NodeId> ids = new ArrayList<>();
@@ -237,7 +306,7 @@ public final class RaftKVCli implements AutoCloseable {
                 need(words, 4);
                 yield client.controller().move(parseInt(words.get(2), "shard"), parseInt(words.get(3), "gid"));
             }
-            default -> throw new IllegalArgumentException("admin needs join, leave or move; type 'help'");
+            default -> throw new IllegalArgumentException("admin needs join, leave, move, add-server, remove-server or transfer-leader; type 'help'");
         };
         out.println("now " + describe(result.join()));
         return true;

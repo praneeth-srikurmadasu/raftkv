@@ -2,6 +2,7 @@ package dev.raftkv.raft;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -71,6 +72,9 @@ class FollowerAppendRulesTest {
     AppendEntriesReply append(long term, long prevIndex, long prevTerm, long leaderCommit, LogEntry... entries) {
         sent.clear();
         node.handle(new Envelope(LEADER, ME, G, new AppendEntries(term, LEADER, prevIndex, prevTerm, List.of(entries), leaderCommit)));
+        // A success reply that promises durability leaves after the follower's group-commit flush,
+        // which runs as the next task on the node's loop (a rejection leaves at once).
+        sim.runUntil(() -> !sent.isEmpty(), Duration.ofMillis(1));
         assertThat(sent).hasSize(1);
         return (AppendEntriesReply) sent.get(0);
     }

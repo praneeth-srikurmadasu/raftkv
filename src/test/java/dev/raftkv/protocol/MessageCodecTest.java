@@ -120,6 +120,7 @@ class MessageCodecTest {
     void lyingEntryCountDoesNotAllocate() {
         Bytes payload = new BinaryWriter()
                 .writeLong(1).writeInt(1).writeLong(0).writeLong(0).writeLong(0) // term, leader, prev idx/term, commit
+                .writeLong(0)                                                    // heartbeat round
                 .writeInt(Integer.MAX_VALUE)                                     // "2 billion entries follow"
                 .toBytes();
         assertThatThrownBy(() -> MessageCodec.decode(MessageType.APPEND_ENTRIES, payload))
@@ -133,7 +134,7 @@ class MessageCodecTest {
                 .isInstanceOf(CodecException.class).hasMessageContaining("term");
 
         Bytes badEntryType = new BinaryWriter()
-                .writeLong(1).writeInt(1).writeLong(0).writeLong(0).writeLong(0).writeInt(1)
+                .writeLong(1).writeInt(1).writeLong(0).writeLong(0).writeLong(0).writeLong(0).writeInt(1)
                 .writeLong(1).writeLong(1).writeByte(42).writeBytes(Bytes.EMPTY)
                 .toBytes();
         assertThatThrownBy(() -> MessageCodec.decode(MessageType.APPEND_ENTRIES, badEntryType))

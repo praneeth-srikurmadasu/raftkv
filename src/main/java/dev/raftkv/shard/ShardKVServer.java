@@ -22,6 +22,7 @@ import dev.raftkv.common.NodeId;
 import dev.raftkv.common.Scheduler;
 import dev.raftkv.kv.KVCodec;
 import dev.raftkv.kv.KVCommand;
+import dev.raftkv.kv.KVResult;
 import dev.raftkv.kv.SessionCommand;
 import dev.raftkv.protocol.ClientReply;
 import dev.raftkv.protocol.ClientRequest;
@@ -33,6 +34,7 @@ import dev.raftkv.protocol.FetchShardReply;
 import dev.raftkv.raft.Bug;
 import dev.raftkv.raft.NotLeaderException;
 import dev.raftkv.raft.RaftNode;
+import dev.raftkv.raft.ReadMode;
 import dev.raftkv.raft.Role;
 import dev.raftkv.transport.ClientRegistry;
 import dev.raftkv.transport.Envelope;
@@ -149,6 +151,10 @@ public final class ShardKVServer implements MessageHandler {
             reply(envelope, ClientReply.to(request, early, null, Bytes.EMPTY));
             return;
         }
+        if (command instanceof KVCommand.Get get && raft.config().readMode() != ReadMode.LOG) {
+            readWithoutLog(envelope, request, get);
+            return;
+        }
         SessionCommand entry = new SessionCommand(request.clientId(), request.sequence(), request.ackedBelow(),
                 clock.wallMillis(), request.command());
         raft.propose(KVCodec.encode(entry)).whenComplete((committed, error) -> {
@@ -160,6 +166,29 @@ public final class ShardKVServer implements MessageHandler {
                 NodeId hint = cause instanceof NotLeaderException nle ? nle.leaderHint().orElse(null) : null;
                 reply(envelope, ClientReply.to(request, ClientStatus.NOT_LEADER, hint, Bytes.EMPTY));
             }
+        });
+    }
+
+    /**
+     * GET without a log entry (SPEC §4.4). Once ReadIndex (or the lease) has confirmed that we are
+     * still the leader and we have applied everything committed when the read arrived, ownership is
+     * checked again against that state: the shard may have moved away in the meantime.
+     */
+    private void readWithoutLog(Envelope envelope, ClientRequest request, KVCommand.Get get) {
+        raft.read(raft.config().readMode()).whenComplete((index, error) -> {
+            if (error != null) {
+                Throwable cause = error.getCause() != null ? error.getCause() : error;
+                NodeId hint = cause instanceof NotLeaderException nle ? nle.leaderHint().orElse(null) : null;
+                reply(envelope, ClientReply.to(request, ClientStatus.NOT_LEADER, hint, Bytes.EMPTY));
+                return;
+            }
+            ClientStatus now = raft.config().has(Bug.CHECK_OWNERSHIP_ON_RECEIVE_ONLY) ? ClientStatus.OK : sm.receiveCheck(get.key());
+            if (now != ClientStatus.OK) {
+                reply(envelope, ClientReply.to(request, now, null, Bytes.EMPTY));
+                return;
+            }
+            Bytes result = KVCodec.encode(new KVResult.GetResult(sm.peek(get.key())));
+            reply(envelope, ClientReply.to(request, ClientStatus.OK, null, result));
         });
     }
 

@@ -14,6 +14,7 @@ import dev.raftkv.protocol.ClientStatus;
 import dev.raftkv.raft.Bug;
 import dev.raftkv.raft.NotLeaderException;
 import dev.raftkv.raft.RaftNode;
+import dev.raftkv.raft.ReadMode;
 import dev.raftkv.raft.Role;
 import dev.raftkv.transport.Envelope;
 import dev.raftkv.transport.Transport;
@@ -91,6 +92,9 @@ public final class KVServer {
             reply(envelope, ClientReply.to(request, ClientStatus.INVALID_REQUEST, null, Bytes.EMPTY));
             return;
         }
+        if (localStore != null && raft.config().readMode() != ReadMode.LOG && readWithoutLog(envelope, request)) {
+            return;
+        }
         SessionCommand entry = new SessionCommand(request.clientId(), request.sequence(), request.ackedBelow(),
                 clock.wallMillis(), request.command());
         raft.propose(KVCodec.encode(entry)).whenComplete((committed, error) -> {
@@ -104,6 +108,34 @@ public final class KVServer {
                 reply(envelope, ClientReply.to(request, ClientStatus.NOT_LEADER, hint, Bytes.EMPTY));
             }
         });
+    }
+
+    /**
+     * GET without a log entry (SPEC §4.4): ReadIndex or lease, then the local state machine, which
+     * by then has applied everything committed when the read arrived. Reads need no session
+     * entry: they change nothing, so running one twice is harmless. Returns false for non-GETs.
+     */
+    private boolean readWithoutLog(Envelope envelope, ClientRequest request) {
+        KVCommand command;
+        try {
+            command = KVCodec.decodeCommand(request.command());
+        } catch (CodecException e) {
+            return false;
+        }
+        if (!(command instanceof KVCommand.Get get)) {
+            return false;
+        }
+        raft.read(raft.config().readMode()).whenComplete((index, error) -> {
+            if (error == null) {
+                Bytes result = KVCodec.encode(new KVResult.GetResult(localStore.peek(get.key())));
+                reply(envelope, ClientReply.to(request, ClientStatus.OK, null, result));
+            } else {
+                Throwable cause = error.getCause() != null ? error.getCause() : error;
+                NodeId hint = cause instanceof NotLeaderException nle ? nle.leaderHint().orElse(null) : null;
+                reply(envelope, ClientReply.to(request, ClientStatus.NOT_LEADER, hint, Bytes.EMPTY));
+            }
+        });
+        return true;
     }
 
     /** The broken read path: answer a GET from whatever this replica happens to have applied. */

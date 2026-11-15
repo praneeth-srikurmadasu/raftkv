@@ -23,7 +23,7 @@ class ReplicationBugDetectionTest {
      */
     @Test
     void detectsCommittingEarlierTermEntriesByCounting() {
-        assertThatThrownBy(() -> Figure8Test.play(1, RaftConfig.defaults().withBugs(Bug.COMMIT_PREVIOUS_TERM_BY_COUNT)))
+        assertThatThrownBy(() -> Figure8Test.play(1, Figure8Test.CLASSIC.withBugs(Bug.COMMIT_PREVIOUS_TERM_BY_COUNT)))
                 .isInstanceOf(SimulationException.class);
         report(Bug.COMMIT_PREVIOUS_TERM_BY_COUNT, Optional.of(0));
     }
