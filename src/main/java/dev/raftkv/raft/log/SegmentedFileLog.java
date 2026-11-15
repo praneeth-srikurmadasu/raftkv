@@ -48,6 +48,14 @@ import dev.raftkv.raft.storage.CorruptStateException;
  *
  * <p>An in-memory index keeps (offset, term) for every entry, so {@link #termAt}, which Raft
  * calls constantly, never touches the disk.
+ *
+ * <h2>Compaction (Milestone 8)</h2>
+ * {@link #compactPrefix} deletes whole segments that a snapshot covers, oldest first with a
+ * directory sync after each delete (so a crash leaves an unbroken run of segments). Entries of a
+ * partly covered segment stay in the file but are no longer visible. {@link #reset} deletes every
+ * segment and starts a new, empty one named after the next index, so the log's position survives
+ * a restart. After recovery the first segment's first index tells where the log starts; the term
+ * just before it is learned from the snapshot ({@link #compactPrefix} with that index).
  */
 public final class SegmentedFileLog implements RaftLog {
 
@@ -63,6 +71,9 @@ public final class SegmentedFileLog implements RaftLog {
     private boolean directoryDirty;
     private long lastIndex;
     private long lastTerm;
+    /** Entries up to this index are covered by a snapshot and hidden (some may still be in the first file). */
+    private long snapshotIndex;
+    private long snapshotTerm;
 
     private static final class Segment {
         final long firstIndex;
@@ -122,6 +133,12 @@ public final class SegmentedFileLog implements RaftLog {
         for (int i = 0; i < firsts.size(); i++) {
             long first = firsts.get(i);
             boolean isLast = i == firsts.size() - 1;
+            if (i == 0 && first > 1) {
+                // Older segments were compacted away: the log starts after a snapshot. Its term is
+                // unknown until the snapshot tells us (compactPrefix).
+                lastIndex = first - 1;
+                snapshotIndex = first - 1;
+            }
             if (first != lastIndex + 1) {
                 throw new CorruptStateException("log segment " + segmentName(first) + " should start at "
                         + (lastIndex + 1) + " (gap or overlap between segments)");
@@ -150,6 +167,16 @@ public final class SegmentedFileLog implements RaftLog {
         if (segments.isEmpty()) {
             createSegment(1);
         }
+    }
+
+    @Override
+    public long snapshotIndex() {
+        return snapshotIndex;
+    }
+
+    @Override
+    public long snapshotTerm() {
+        return snapshotTerm;
     }
 
     /** Validates and indexes the record at {@code offset}; returns a description of the problem, or null. */
@@ -211,15 +238,17 @@ public final class SegmentedFileLog implements RaftLog {
 
     @Override
     public long termAt(long index) {
-        if (index == 0) {
-            return 0;
+        if (index == snapshotIndex) {
+            return snapshotTerm;
         }
+        checkVisible(index);
         Segment s = segmentFor(index);
         return s.terms.get((int) (index - s.firstIndex));
     }
 
     @Override
     public LogEntry entryAt(long index) {
+        checkVisible(index);
         Segment s = segmentFor(index);
         long offset = s.offsets.get((int) (index - s.firstIndex));
         int length = ByteBuffer.wrap(s.file.readFully(offset, 4)).getInt();
@@ -234,8 +263,9 @@ public final class SegmentedFileLog implements RaftLog {
 
     @Override
     public List<LogEntry> entriesFrom(long fromIndex, int maxCount) {
-        if (fromIndex < 1 || fromIndex > lastIndex + 1) {
-            throw new IndexOutOfBoundsException("fromIndex " + fromIndex + " outside [1, " + (lastIndex + 1) + "]");
+        if (fromIndex <= snapshotIndex || fromIndex > lastIndex + 1) {
+            throw new IndexOutOfBoundsException("fromIndex " + fromIndex + " outside [" + (snapshotIndex + 1) + ", "
+                    + (lastIndex + 1) + "]");
         }
         if (maxCount < 0) {
             throw new IllegalArgumentException("maxCount must be >= 0");
@@ -308,8 +338,9 @@ public final class SegmentedFileLog implements RaftLog {
 
     @Override
     public void truncateSuffix(long fromIndex) {
-        if (fromIndex < 1 || fromIndex > lastIndex + 1) {
-            throw new IndexOutOfBoundsException("fromIndex " + fromIndex + " outside [1, " + (lastIndex + 1) + "]");
+        if (fromIndex <= snapshotIndex || fromIndex > lastIndex + 1) {
+            throw new IndexOutOfBoundsException("fromIndex " + fromIndex + " outside [" + (snapshotIndex + 1) + ", "
+                    + (lastIndex + 1) + "]");
         }
         if (fromIndex == lastIndex + 1) {
             return;
@@ -348,6 +379,68 @@ public final class SegmentedFileLog implements RaftLog {
     }
 
     @Override
+    public void compactPrefix(long upToIndex, long upToTerm) {
+        if (upToIndex < snapshotIndex || upToIndex > lastIndex) {
+            throw new IndexOutOfBoundsException("cannot compact to " + upToIndex + ": log holds [" + snapshotIndex + ", "
+                    + lastIndex + "]");
+        }
+        if (upToIndex == snapshotIndex) {
+            // Typically right after recovery: we know where the log starts but not the term there.
+            if (snapshotTerm != 0 && snapshotTerm != upToTerm) {
+                throw new IllegalArgumentException("term at " + upToIndex + " is " + snapshotTerm + ", not " + upToTerm);
+            }
+            snapshotTerm = upToTerm;
+            if (lastIndex == upToIndex) {
+                lastTerm = upToTerm;
+            }
+            return;
+        }
+        long termThere = termAt(upToIndex);
+        if (termThere != upToTerm) {
+            throw new IllegalArgumentException("term at " + upToIndex + " is " + termThere + ", not " + upToTerm);
+        }
+        // Delete segments whose every entry is covered, oldest first, one durable delete at a time,
+        // so whatever survives a crash is still an unbroken run. The last segment always stays:
+        // it is where the next entry goes, and its name records where the log continues.
+        if (directoryDirty) {
+            disk.syncDirectory(dir);
+            directoryDirty = false;
+        }
+        while (segments.size() > 1 && segments.get(1).firstIndex <= upToIndex + 1) {
+            Segment gone = segments.remove(0);
+            gone.file.close();
+            disk.delete(gone.path);
+            disk.syncDirectory(dir);
+        }
+        snapshotIndex = upToIndex;
+        snapshotTerm = upToTerm;
+    }
+
+    @Override
+    public void reset(long index, long term) {
+        if (index < 0 || term < 0 || (index == 0) != (term == 0)) {
+            throw new IllegalArgumentException("bad snapshot position " + index + "@t" + term);
+        }
+        if (directoryDirty) {
+            disk.syncDirectory(dir);
+            directoryDirty = false;
+        }
+        while (!segments.isEmpty()) {
+            Segment gone = segments.remove(segments.size() - 1);
+            gone.file.close();
+            disk.delete(gone.path);
+            disk.syncDirectory(dir);
+        }
+        snapshotIndex = index;
+        snapshotTerm = term;
+        lastIndex = index;
+        lastTerm = term;
+        createSegment(index + 1);
+        disk.syncDirectory(dir); // the empty segment's name records where the log continues
+        directoryDirty = false;
+    }
+
+    @Override
     public void close() {
         for (Segment seg : segments) {
             seg.file.close();
@@ -380,10 +473,13 @@ public final class SegmentedFileLog implements RaftLog {
         return new Segment(firstIndex, path, disk);
     }
 
-    private Segment segmentFor(long index) {
-        if (index < 1 || index > lastIndex) {
-            throw new IndexOutOfBoundsException("index " + index + " outside log [1, " + lastIndex + "]");
+    private void checkVisible(long index) {
+        if (index <= snapshotIndex || index > lastIndex) {
+            throw new IndexOutOfBoundsException("index " + index + " outside log [" + (snapshotIndex + 1) + ", " + lastIndex + "]");
         }
+    }
+
+    private Segment segmentFor(long index) {
         int lo = 0;
         int hi = segments.size() - 1;
         while (lo < hi) {

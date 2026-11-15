@@ -39,6 +39,10 @@ raftkv> leader
 n2
 raftkv> quit
 ```
+The `raftkv>` prompt is the client itself: it only understands its own commands (`help` lists them), not PowerShell. `get` on a key nobody has `put` yet prints `(not found)`.
+
+(Since Milestone 9 the cluster is sharded and `leader` prints one leader per group; see 09-multi-raft-and-controller.md.)
+
 Now kill the leader (here n2) with no warning, like pulling its power cord:
 ```powershell
 .\scripts\kill-node.ps1 -Id 2

@@ -32,17 +32,31 @@ public final class RandomMessages {
             case APPEND_ENTRIES -> appendEntries(r);
             case APPEND_ENTRIES_REPLY -> new AppendEntriesReply(edgeLong(r), r.nextBoolean(), edgeLong(r), edgeLong(r), edgeLong(r));
             case INSTALL_SNAPSHOT -> new InstallSnapshot(edgeLong(r), node(r), edgeLong(r), edgeLong(r), edgeLong(r), bytes(r, 512), r.nextBoolean());
-            case INSTALL_SNAPSHOT_REPLY -> new InstallSnapshotReply(edgeLong(r));
+            case INSTALL_SNAPSHOT_REPLY -> new InstallSnapshotReply(edgeLong(r), edgeLong(r), edgeLong(r), r.nextBoolean());
             case TIMEOUT_NOW -> new TimeoutNow(edgeLong(r), node(r));
             case CLIENT_REQUEST -> {
                 long seq = 1 + (edgeLong(r) % (Long.MAX_VALUE - 1));
                 long acked = 1 + (r.nextLong() & Long.MAX_VALUE) % seq;
                 yield new ClientRequest(new java.util.UUID(r.nextLong(), r.nextLong()), seq, acked, bytes(r, 256));
             }
-            case CLIENT_REPLY -> new ClientReply(1 + (edgeLong(r) % (Long.MAX_VALUE - 1)),
+            case CLIENT_REPLY -> new ClientReply(new java.util.UUID(r.nextLong(), r.nextLong()),
+                    1 + (edgeLong(r) % (Long.MAX_VALUE - 1)),
                     ClientStatus.values()[r.nextInt(ClientStatus.values().length)],
                     r.nextBoolean() ? node(r) : null, bytes(r, 256));
+            case FETCH_SHARD -> new FetchShard(edgeLong(r), r.nextInt(Integer.MAX_VALUE), shards(r));
+            case FETCH_SHARD_REPLY -> new FetchShardReply(edgeLong(r), r.nextBoolean(), bytes(r, 512));
+            case DELETE_SHARD -> new DeleteShard(edgeLong(r), r.nextInt(Integer.MAX_VALUE), shards(r));
+            case DELETE_SHARD_REPLY -> new DeleteShardReply(edgeLong(r), r.nextBoolean(), shards(r));
         };
+    }
+
+    private static List<Integer> shards(Random r) {
+        int n = r.nextInt(8);
+        List<Integer> out = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            out.add(r.nextInt(r.nextBoolean() ? 64 : Integer.MAX_VALUE));
+        }
+        return out;
     }
 
     public static List<Message> list(Random r, int count) {

@@ -46,7 +46,7 @@ import dev.raftkv.protocol.MessageCodec;
  * {@code ["RKV1":4][version:1][sender NodeId:4]}. After that it carries frames (SPEC §5.1).
  * Connections are found by the remote node id, whichever side dialed: a server can reply to a
  * client over the connection the client opened. One connection carries every Raft group
- * (frames carry the group id).
+ * (frames carry the group id). A message to this node itself is handed to the handler directly.
  *
  * <h2>Failures</h2>
  * Delivery is best effort, as the {@link Transport} contract says. A broken connection is closed
@@ -167,6 +167,13 @@ public final class NioTransport implements Transport, AutoCloseable {
     @Override
     public void send(NodeId to, GroupId group, Message message) {
         if (closed) {
+            return;
+        }
+        if (to.equals(self)) {
+            // To ourselves (e.g. a data group's config poller asking the controller replica in the
+            // same process): no socket, but still asynchronous, like any other delivery.
+            commands.add(() -> handler.onMessage(new Envelope(self, self, group, message)));
+            selector.wakeup();
             return;
         }
         ByteBuffer frame = FrameCodec.encode(MessageCodec.toFrame(group, 0, message));

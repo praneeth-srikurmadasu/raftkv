@@ -50,7 +50,7 @@ final class KVChaos {
 
     static Result run(long seed, RaftConfig config, SimulatedCluster.Storage storage) {
         Random r = new Random(seed);
-        SimulatedCluster c = SimulatedCluster.kv(seed, r.nextBoolean() ? 3 : 5, config, storage);
+        SimulatedCluster c = SimulatedCluster.kv(seed, r.nextBoolean() ? 3 : 5, SnapshotSwarm.pick(seed, config), storage);
         List<Writer> writers = new ArrayList<>();
         try {
             boolean partitions = r.nextInt(4) != 0;

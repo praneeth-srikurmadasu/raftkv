@@ -1,5 +1,6 @@
 package dev.raftkv.raft;
 
+import java.io.ByteArrayOutputStream;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -33,8 +34,11 @@ import dev.raftkv.protocol.TimeoutNow;
 import dev.raftkv.raft.log.EntryType;
 import dev.raftkv.raft.log.LogEntry;
 import dev.raftkv.raft.log.RaftLog;
+import dev.raftkv.raft.storage.InMemorySnapshotStore;
 import dev.raftkv.raft.storage.MetaStore;
 import dev.raftkv.raft.storage.PersistentState;
+import dev.raftkv.raft.storage.Snapshot;
+import dev.raftkv.raft.storage.SnapshotStore;
 import dev.raftkv.transport.Envelope;
 import dev.raftkv.transport.Transport;
 
@@ -44,7 +48,10 @@ import dev.raftkv.transport.Transport;
  * <p><b>Scope so far:</b> leader election (Milestone 2) and log replication (Milestone 3):
  * AppendEntries with the full Figure 2 receiver rules, fast backtracking, the commit rule that
  * only counts replicas for entries of the current term (§5.4.2, Figure 8), a no-op entry on
- * election, and applying committed entries to the {@link StateMachine} in order.
+ * election, and applying committed entries to the {@link StateMachine} in order. Milestone 8
+ * adds snapshots (§7): once enough applied entries pile up, the state machine is snapshotted,
+ * the snapshot saved durably, and the log prefix it covers discarded; a follower too far behind
+ * for the remaining log gets the snapshot in chunks (InstallSnapshot, Figure 13).
  *
  * <p><b>Threading.</b> Every public method must be called on this node's {@link Scheduler}
  * (its event loop). The node never blocks and never creates threads, which is what makes it
@@ -72,6 +79,7 @@ public final class RaftNode {
     private final RaftLog log;
     private final MetaStore metaStore;
     private final StateMachine stateMachine;
+    private final SnapshotStore snapshotStore;
     private final Tracer tracer;
 
     // ---- Persistent state on all servers (Figure 2); the log is the third piece.
@@ -112,6 +120,25 @@ public final class RaftNode {
     private long lastLeaderContactNanos;
     private boolean heardFromLeader;
 
+    // ---- Snapshots.
+    /** The snapshot our log was compacted to (what we send to followers that are too far behind). */
+    private Snapshot latestSnapshot;
+    /** A snapshot arriving from the leader in chunks. */
+    private IncomingSnapshot incoming;
+    private long snapshotsTaken;
+    private long snapshotsInstalled;
+
+    private static final class IncomingSnapshot {
+        final long index;
+        final long term;
+        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+
+        IncomingSnapshot(long index, long term) {
+            this.index = index;
+            this.term = term;
+        }
+    }
+
     // ---- Counters for tests and metrics.
     private long electionsStarted;
 
@@ -126,7 +153,8 @@ public final class RaftNode {
         this.transport = Objects.requireNonNull(b.transport, "transport");
         this.log = Objects.requireNonNull(b.log, "log");
         this.metaStore = Objects.requireNonNull(b.metaStore, "metaStore");
-        this.stateMachine = b.stateMachine == null ? (index, command) -> Bytes.EMPTY : b.stateMachine;
+        this.stateMachine = b.stateMachine == null ? new NoState() : b.stateMachine;
+        this.snapshotStore = b.snapshotStore == null ? new InMemorySnapshotStore() : b.snapshotStore;
         this.tracer = b.tracer == null ? Tracer.NOOP : b.tracer;
         if (!voters.contains(self)) {
             throw new IllegalArgumentException(self + " must be one of the voters " + voters);
@@ -138,6 +166,24 @@ public final class RaftNode {
 
     public static Builder builder() {
         return new Builder();
+    }
+
+    /** The state machine of a node built without one: applies nothing, snapshots to nothing. */
+    private static final class NoState implements StateMachine {
+        @Override
+        public Bytes apply(long index, Bytes command) {
+            return Bytes.EMPTY;
+        }
+
+        @Override
+        public Bytes snapshot() {
+            return Bytes.EMPTY;
+        }
+
+        @Override
+        public void restore(Bytes snapshot) {
+            // nothing to restore
+        }
     }
 
     // =====================================================================================
@@ -152,17 +198,42 @@ public final class RaftNode {
         PersistentState persisted = metaStore.load();
         currentTerm = persisted.currentTerm();
         votedFor = persisted.votedFor();
+        // The state machine is rebuilt from the latest snapshot plus the log after it. commitIndex
+        // and lastApplied are volatile (Figure 2), but everything a snapshot covers was committed
+        // and applied, so they restart at its index instead of 0.
+        latestSnapshot = snapshotStore.load().orElse(null);
+        incoming = null;
+        commitIndex = 0;
+        lastApplied = 0;
+        if (latestSnapshot != null) {
+            long si = latestSnapshot.lastIncludedIndex();
+            long st = latestSnapshot.lastIncludedTerm();
+            if (si < log.snapshotIndex()) {
+                throw new IllegalStateException("corrupt state: log starts after " + log.snapshotIndex()
+                        + " but the snapshot only covers up to " + si);
+            }
+            if (log.contains(si) && (si == log.snapshotIndex() || log.termAt(si) == st)) {
+                log.compactPrefix(si, st); // keep the entries after the snapshot
+            } else {
+                log.reset(si, st);         // the log is behind the snapshot, or conflicts with it
+            }
+            stateMachine.restore(latestSnapshot.data());
+            commitIndex = si;
+            lastApplied = si;
+        } else if (log.snapshotIndex() > 0) {
+            throw new IllegalStateException("corrupt state: log starts after " + log.snapshotIndex()
+                    + " but there is no snapshot");
+        }
         if (currentTerm < log.lastTerm()) {
             throw new IllegalStateException("corrupt state: currentTerm " + currentTerm
                     + " is older than the last log term " + log.lastTerm());
         }
         running = true;
         role = Role.FOLLOWER;
-        commitIndex = 0;   // volatile: relearned from the leader
-        lastApplied = 0;   // volatile: the state machine is rebuilt by re-applying the log
         durableIndex = log.lastIndex(); // whatever survived the restart is on disk
         flushScheduled = false;
-        trace("started (votedFor=" + votedFor + ", last log " + log.lastIndex() + "@t" + log.lastTerm() + ")");
+        trace("started (votedFor=" + votedFor + ", last log " + log.lastIndex() + "@t" + log.lastTerm()
+                + (latestSnapshot != null ? ", snapshot " + latestSnapshot.lastIncludedIndex() : "") + ")");
         resetElectionTimer();
     }
 
@@ -243,8 +314,8 @@ public final class RaftNode {
             case RequestVoteReply m -> onRequestVoteReply(from, m);
             case AppendEntries m -> onAppendEntries(from, m);
             case AppendEntriesReply m -> onAppendEntriesReply(from, m);
-            case InstallSnapshot m -> trace("ignored InstallSnapshot (Milestone 8)");
-            case InstallSnapshotReply m -> trace("ignored InstallSnapshotReply (Milestone 8)");
+            case InstallSnapshot m -> onInstallSnapshot(from, m);
+            case InstallSnapshotReply m -> onInstallSnapshotReply(from, m);
             case TimeoutNow m -> trace("ignored TimeoutNow (Milestone 12)");
         }
     }
@@ -333,25 +404,20 @@ public final class RaftNode {
         if (ae.term() > currentTerm) {
             return; // only reachable with Bug.LEADER_IGNORES_HIGHER_TERM
         }
-        if (role == Role.LEADER) {
-            // Election Safety (§5.2): at most one leader per term. Seeing another one is a bug.
-            throw new IllegalStateException(self + " is leader of term " + currentTerm
-                    + " but received AppendEntries from " + from + " for the same term");
+        if (!acceptLeader(from)) {
+            return;
         }
-        if (role == Role.CANDIDATE) {
-            // Fig.2 Candidates: "If AppendEntries RPC received from new leader: convert to follower".
-            becomeFollower("leader " + from + " exists for t" + currentTerm);
-        }
-        if (!from.equals(leaderId)) {
-            leaderId = from;
-            trace("following leader " + from);
-        }
-        heardFromLeader = true;
-        lastLeaderContactNanos = clock.nanos();
-        // Fig.2 Followers: hearing from the current leader restarts the election timer.
-        resetElectionTimer();
 
         long prevIndex = ae.prevLogIndex();
+        if (prevIndex < log.snapshotIndex()) {
+            // The message starts inside our snapshot (it is stale, or the leader doesn't know how
+            // far we are). Everything up to our commitIndex is committed, so it is in the leader's
+            // log too and durable here: report it as matching (as etcd does), and the leader
+            // continues from there. A rejection would not work: a leader never raises nextIndex
+            // because of a rejection, so it could keep sending from below our snapshot forever.
+            send(from, new AppendEntriesReply(currentTerm, true, commitIndex, 0, 0));
+            return;
+        }
         // Fig.2 AppendEntries rule 2: "Reply false if log doesn't contain an entry at
         // prevLogIndex whose term matches prevLogTerm (§5.3)".
         if (!log.contains(prevIndex)) {
@@ -393,6 +459,31 @@ public final class RaftNode {
             }
         }
         send(from, new AppendEntriesReply(currentTerm, true, lastNewIndex, 0, 0));
+    }
+
+    /**
+     * A message from the leader of our current term arrived (AppendEntries or InstallSnapshot):
+     * follow it and restart the election timer. Returns false if the message must be dropped.
+     */
+    private boolean acceptLeader(NodeId from) {
+        if (role == Role.LEADER) {
+            // Election Safety (§5.2): at most one leader per term. Seeing another one is a bug.
+            throw new IllegalStateException(self + " is leader of term " + currentTerm
+                    + " but received a leader message from " + from + " for the same term");
+        }
+        if (role == Role.CANDIDATE) {
+            // Fig.2 Candidates: "If AppendEntries RPC received from new leader: convert to follower".
+            becomeFollower("leader " + from + " exists for t" + currentTerm);
+        }
+        if (!from.equals(leaderId)) {
+            leaderId = from;
+            trace("following leader " + from);
+        }
+        heardFromLeader = true;
+        lastLeaderContactNanos = clock.nanos();
+        // Fig.2 Followers: hearing from the current leader restarts the election timer.
+        resetElectionTimer();
+        return true;
     }
 
     /** Fig.2 AppendEntries rules 3 and 4. Returns true if the log changed. */
@@ -457,10 +548,166 @@ public final class RaftNode {
     /** Smallest index of the run of {@code term} entries that ends at or before {@code fromIndex}. */
     private long firstIndexOfTerm(long term, long fromIndex) {
         long i = fromIndex;
-        while (i > 1 && log.termAt(i - 1) == term) {
+        while (i - 1 > log.snapshotIndex() && log.termAt(i - 1) == term) {
             i--;
         }
         return i;
+    }
+
+    // ---------------------------------------------------------------- InstallSnapshot (receiver)
+
+    /**
+     * Figure 13 receiver implementation, with chunks assembled in memory:
+     * <ol>
+     *   <li>Reply immediately if term &lt; currentTerm.</li>
+     *   <li>Create a new snapshot buffer if first chunk (offset is 0).</li>
+     *   <li>Write data into the buffer at the given offset.</li>
+     *   <li>Reply and wait for more data chunks if done is false.</li>
+     *   <li>Save the snapshot (durably), discard any existing or partial snapshot with a smaller index.</li>
+     *   <li>If an existing log entry has the same index and term as the snapshot's last included
+     *       entry, retain the log entries following it and reply.</li>
+     *   <li>Discard the entire log.</li>
+     *   <li>Reset the state machine using the snapshot contents.</li>
+     * </ol>
+     */
+    private void onInstallSnapshot(NodeId from, InstallSnapshot is) {
+        if (is.term() < currentTerm) {
+            // Rule 1.
+            send(from, new InstallSnapshotReply(currentTerm, is.lastIncludedIndex(), 0, false));
+            return;
+        }
+        if (is.term() > currentTerm) {
+            return; // only reachable with Bug.LEADER_IGNORES_HIGHER_TERM
+        }
+        if (!acceptLeader(from)) {
+            return;
+        }
+        long index = is.lastIncludedIndex();
+        if (index <= lastApplied) {
+            // Our state already includes everything this snapshot holds: never go backwards
+            // (SPEC §3.10). Tell the leader we are at least this far.
+            incoming = null;
+            send(from, new InstallSnapshotReply(currentTerm, index, 0, true));
+            return;
+        }
+        if (is.lastIncludedTerm() < 1) {
+            return; // a snapshot covers at least one real entry; ignore nonsense
+        }
+        IncomingSnapshot in = incoming;
+        if (is.offset() == 0 && (in == null || in.index != index || in.term != is.lastIncludedTerm())) {
+            // Rule 2. (A late duplicate of the first chunk of the snapshot we are already receiving
+            // must not throw away what arrived since: it falls through as out of order below.)
+            in = new IncomingSnapshot(index, is.lastIncludedTerm());
+            incoming = in;
+        }
+        if (in == null || in.index != index || in.term != is.lastIncludedTerm() || is.offset() != in.bytes.size()) {
+            // Out of order, duplicated, or we lost our partial copy (restart): say where to resume.
+            boolean same = in != null && in.index == index && in.term == is.lastIncludedTerm();
+            send(from, new InstallSnapshotReply(currentTerm, index, same ? in.bytes.size() : 0, false));
+            return;
+        }
+        byte[] chunk = is.data().toArray();
+        in.bytes.write(chunk, 0, chunk.length); // rule 3
+        if (!is.done()) {
+            send(from, new InstallSnapshotReply(currentTerm, index, in.bytes.size(), false)); // rule 4
+            return;
+        }
+        incoming = null;
+        installSnapshot(new Snapshot(index, in.term, Bytes.copyOf(in.bytes.toByteArray())));
+        send(from, new InstallSnapshotReply(currentTerm, index, 0, true));
+    }
+
+    /** Figure 13 rules 5-8. */
+    private void installSnapshot(Snapshot snap) {
+        long index = snap.lastIncludedIndex();
+        long term = snap.lastIncludedTerm();
+        // Rule 5: durable BEFORE the log entries it replaces are discarded. A crash in between
+        // leaves the new snapshot plus the old log, which start() reconciles.
+        snapshotStore.save(snap);
+        latestSnapshot = snap;
+        if (log.contains(index) && log.termAt(index) == term) {
+            log.compactPrefix(index, term); // rule 6: keep what follows
+        } else {
+            log.reset(index, term);         // rule 7
+        }
+        stateMachine.restore(snap.data()); // rule 8
+        lastApplied = index;
+        commitIndex = Math.max(commitIndex, index);
+        durableIndex = Math.min(Math.max(durableIndex, index), log.lastIndex());
+        snapshotsInstalled++;
+        trace("installed snapshot " + index + "@t" + term + " (" + snap.data().length() + " bytes)");
+        applyCommitted(); // in case commitIndex was already beyond the snapshot
+    }
+
+    // ---------------------------------------------------------------- InstallSnapshot (leader side)
+
+    private void onInstallSnapshotReply(NodeId from, InstallSnapshotReply reply) {
+        if (role != Role.LEADER || reply.term() != currentTerm) {
+            return;
+        }
+        LeaderState.SnapshotTransfer t = leaderState.transfer(from);
+        if (reply.installed()) {
+            // The follower's state now covers the snapshot: everything up to its index matches ours
+            // (those entries are committed). Continue with AppendEntries right after it.
+            if (reply.lastIncludedIndex() > log.lastIndex()) {
+                throw new IllegalStateException(from + " claims a snapshot at " + reply.lastIncludedIndex()
+                        + " beyond our last index " + log.lastIndex());
+            }
+            long matchBefore = leaderState.matchIndex(from);
+            leaderState.recordMatch(from, reply.lastIncludedIndex());
+            if (t != null && t.snapshot.lastIncludedIndex() <= reply.lastIncludedIndex()) {
+                leaderState.endTransfer(from);
+                trace("snapshot " + reply.lastIncludedIndex() + " reached " + from);
+            }
+            advanceCommitIndex();
+            if (leaderState.matchIndex(from) > matchBefore) {
+                replicateTo(from);
+            }
+            return;
+        }
+        if (t == null || t.snapshot.lastIncludedIndex() != reply.lastIncludedIndex()) {
+            return; // about a transfer that is over
+        }
+        long next = Math.min(reply.nextOffset(), t.snapshot.data().length());
+        if (next > t.acked) {
+            t.acked = next;                        // progress: open the window further
+            t.sent = Math.max(t.sent, next);
+            sendSnapshotChunks(from, t);
+        } else if (next == 0 && t.acked > 0) {
+            t.acked = 0;                           // the follower lost its partial copy (restart): start over
+            t.sent = 0;
+            sendSnapshotChunks(from, t);
+        }
+        // Anything else is stale (an old or duplicated reply), or a chunk rejected because one
+        // before it got lost. The heartbeat goes back to the confirmed offset; reacting to every
+        // such reply would multiply messages (each burst of chunks produces a burst of replies).
+    }
+
+    /** At most this many chunks are in flight to one follower. */
+    static final int SNAPSHOT_WINDOW = 8;
+
+    /** Sends chunks from {@code t.sent} until the window is full or the whole snapshot is in flight. */
+    private void sendSnapshotChunks(NodeId peer, LeaderState.SnapshotTransfer t) {
+        Snapshot snap = t.snapshot;
+        int size = snap.data().length();
+        long window = (long) SNAPSHOT_WINDOW * config.snapshotChunkBytes();
+        if (size == 0) {
+            sendChunk(peer, t, 0, 0, true); // an empty state is one (empty, final) chunk
+            return;
+        }
+        while (t.sent < size && t.sent - t.acked < window) {
+            int offset = (int) t.sent;
+            int length = Math.min(config.snapshotChunkBytes(), size - offset);
+            sendChunk(peer, t, offset, length, offset + length == size);
+            t.sent = offset + length;
+        }
+    }
+
+    private void sendChunk(NodeId peer, LeaderState.SnapshotTransfer t, int offset, int length, boolean done) {
+        Snapshot snap = t.snapshot;
+        t.lastSentNanos = clock.nanos();
+        send(peer, new InstallSnapshot(currentTerm, self, snap.lastIncludedIndex(), snap.lastIncludedTerm(),
+                offset, snap.data().slice(offset, length), done));
     }
 
     // ---------------------------------------------------------------- AppendEntries (leader side)
@@ -505,9 +752,9 @@ public final class RaftNode {
         // heartbeat retries anyway.
     }
 
-    /** Last index in our log whose term is {@code term}, or 0 if we have none. */
+    /** Last index in our log whose term is {@code term}, or 0 if we have none (or can't tell). */
     private long lastIndexOfTerm(long term) {
-        for (long i = log.lastIndex(); i >= 1; i--) {
+        for (long i = log.lastIndex(); i > log.snapshotIndex(); i--) {
             long t = log.termAt(i);
             if (t == term) {
                 return i;
@@ -533,6 +780,21 @@ public final class RaftNode {
      */
     private void replicateTo(NodeId peer) {
         long next = leaderState.nextIndex(peer);
+        if (next <= log.snapshotIndex()) {
+            // The entries this follower needs are gone from our log: send the snapshot (§7).
+            LeaderState.SnapshotTransfer t = leaderState.transfer(peer);
+            if (t == null) {
+                t = leaderState.startTransfer(peer, latestSnapshot);
+                trace("sending snapshot " + latestSnapshot.lastIncludedIndex() + " to " + peer);
+            } else if (clock.nanos() - t.lastSentNanos < config.heartbeatInterval().toNanos()) {
+                return; // chunks are in flight; don't add more on every proposal
+            } else {
+                t.sent = t.acked; // nothing heard for a heartbeat: go back to what is confirmed
+            }
+            sendSnapshotChunks(peer, t);
+            return;
+        }
+        leaderState.endTransfer(peer);
         long prevIndex = next - 1;
         List<LogEntry> entries = next <= log.lastIndex()
                 ? log.entriesFrom(next, config.maxEntriesPerAppend())
@@ -559,6 +821,9 @@ public final class RaftNode {
         long n = matches.get(voters.size() / 2); // highest index stored on a majority
         if (n <= commitIndex) {
             return;
+        }
+        if (n <= log.snapshotIndex()) {
+            return; // can't happen (our snapshot only covers committed entries); be safe anyway
         }
         if (log.termAt(n) != currentTerm && !config.has(Bug.COMMIT_PREVIOUS_TERM_BY_COUNT)) {
             return; // stored on a majority, but not safe to commit by counting (Figure 8)
@@ -588,6 +853,29 @@ public final class RaftNode {
                 }
             }
         }
+        maybeSnapshot();
+    }
+
+    /**
+     * Takes a snapshot at lastApplied once enough applied entries are not covered by the latest
+     * one (SPEC §3.8), saves it durably, and only then discards the log prefix it covers.
+     *
+     * <p>Serialization happens right here on the event loop (see docs/design.md, Deviations).
+     */
+    private void maybeSnapshot() {
+        long threshold = config.snapshotThreshold();
+        if (threshold <= 0 || lastApplied - log.snapshotIndex() < threshold) {
+            return;
+        }
+        long index = lastApplied;
+        long term = log.termAt(index);
+        Snapshot snap = new Snapshot(index, term, stateMachine.snapshot());
+        snapshotStore.save(snap);   // durable first ...
+        latestSnapshot = snap;
+        log.compactPrefix(index, term); // ... then the covered entries can go
+        durableIndex = Math.min(Math.max(durableIndex, index), log.lastIndex());
+        snapshotsTaken++;
+        trace("took snapshot " + index + "@t" + term + " (" + snap.data().length() + " bytes)");
     }
 
     private void failPending() {
@@ -825,6 +1113,21 @@ public final class RaftNode {
         return logSyncs;
     }
 
+    /** Snapshots this node took itself (tests and metrics). */
+    public long snapshotsTaken() {
+        return snapshotsTaken;
+    }
+
+    /** Snapshots this node installed from a leader (tests and metrics). */
+    public long snapshotsInstalled() {
+        return snapshotsInstalled;
+    }
+
+    /** The snapshot the log is compacted to, if any. */
+    public Optional<Snapshot> latestSnapshot() {
+        return Optional.ofNullable(latestSnapshot);
+    }
+
     /** Number of proposals still waiting to be applied (tests and metrics). */
     public int pendingProposals() {
         return pending.size();
@@ -857,6 +1160,7 @@ public final class RaftNode {
         private RaftLog log;
         private MetaStore metaStore;
         private StateMachine stateMachine;
+        private SnapshotStore snapshotStore;
         private Tracer tracer;
 
         private Builder() {
@@ -873,6 +1177,7 @@ public final class RaftNode {
         public Builder log(RaftLog v) { this.log = v; return this; }
         public Builder metaStore(MetaStore v) { this.metaStore = v; return this; }
         public Builder stateMachine(StateMachine v) { this.stateMachine = v; return this; }
+        public Builder snapshotStore(SnapshotStore v) { this.snapshotStore = v; return this; }
         public Builder tracer(Tracer v) { this.tracer = v; return this; }
 
         public RaftNode build() {

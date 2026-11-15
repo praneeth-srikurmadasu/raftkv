@@ -2,7 +2,8 @@ package dev.raftkv.protocol;
 
 /**
  * Every message that can travel between RaftKV processes: Raft's own messages between servers
- * ({@link RaftMessage}) and client requests/replies ({@link ClientRequest}, {@link ClientReply}).
+ * ({@link RaftMessage}), client requests/replies ({@link ClientRequest}, {@link ClientReply}), and
+ * shard moves between replica groups ({@link ShardMessage}).
  *
  * <p>{@code sealed} means the compiler knows the complete list of message types. A
  * {@code switch} over a {@code Message} with no {@code default} branch is checked for
@@ -12,7 +13,7 @@ package dev.raftkv.protocol;
  *
  * <p>Clients match replies to requests by {@code (clientId, sequence)}, which the reply echoes.
  */
-public sealed interface Message permits RaftMessage, ClientRequest, ClientReply {
+public sealed interface Message permits RaftMessage, ClientRequest, ClientReply, ShardMessage {
 
     /** The wire type of this message. Exhaustive switch: no default needed. */
     default MessageType type() {
@@ -26,6 +27,10 @@ public sealed interface Message permits RaftMessage, ClientRequest, ClientReply 
             case TimeoutNow m -> MessageType.TIMEOUT_NOW;
             case ClientRequest m -> MessageType.CLIENT_REQUEST;
             case ClientReply m -> MessageType.CLIENT_REPLY;
+            case FetchShard m -> MessageType.FETCH_SHARD;
+            case FetchShardReply m -> MessageType.FETCH_SHARD_REPLY;
+            case DeleteShard m -> MessageType.DELETE_SHARD;
+            case DeleteShardReply m -> MessageType.DELETE_SHARD_REPLY;
         };
     }
 }

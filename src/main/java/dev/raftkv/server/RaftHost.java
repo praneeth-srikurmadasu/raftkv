@@ -1,6 +1,7 @@
 package dev.raftkv.server;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -10,47 +11,44 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
-import dev.raftkv.common.Bytes;
 import dev.raftkv.common.Clock;
 import dev.raftkv.common.EventLoopScheduler;
 import dev.raftkv.common.GroupId;
 import dev.raftkv.common.NodeId;
 import dev.raftkv.common.Tracer;
 import dev.raftkv.io.Disk;
-import dev.raftkv.kv.KVServer;
 import dev.raftkv.kv.KVStateMachine;
-import dev.raftkv.protocol.ClientReply;
-import dev.raftkv.protocol.ClientRequest;
-import dev.raftkv.protocol.ClientStatus;
-import dev.raftkv.protocol.RaftMessage;
 import dev.raftkv.raft.RaftConfig;
 import dev.raftkv.raft.RaftNode;
 import dev.raftkv.raft.Role;
-import dev.raftkv.raft.log.RaftLog;
 import dev.raftkv.raft.log.SegmentedFileLog;
 import dev.raftkv.raft.storage.FileMetaStore;
+import dev.raftkv.raft.storage.FileSnapshotStore;
+import dev.raftkv.shard.ControllerStateMachine;
+import dev.raftkv.shard.ShardKVStateMachine;
+import dev.raftkv.shard.ShardStatus;
 import dev.raftkv.transport.Envelope;
 import dev.raftkv.transport.MessageHandler;
 import dev.raftkv.transport.Transport;
 
 /**
- * Everything one server process runs (SPEC §3.1): a set of Raft groups that share one
- * {@link Transport}. Each group has its own event loop thread, Raft node, log, metadata store,
- * KV state machine and {@link KVServer}.
- *
- * <p>The host is the transport's {@link MessageHandler}: it looks at the group id of each
- * incoming message and hands the message to that group's event loop. Nothing else crosses
- * threads, so the Raft code stays single-threaded exactly as in the simulator. A client
- * request for a group this host does not run gets {@link ClientStatus#WRONG_GROUP}.
+ * Everything one server process runs (SPEC §3.1, §6.2): any number of Raft groups sharing one
+ * {@link Transport}. Each group has its own event loop thread, its own directory with log, meta
+ * file and snapshot, and its own state machine. Incoming messages go through a
+ * {@link MessageRouter}: each one is handed to its group's event loop, so the Raft code stays
+ * single-threaded exactly as in the simulator.
  *
  * <p>Typical use: {@code new RaftHost(...)}, start a transport with the host as its handler,
- * {@link #attach} it, then {@link #addGroup} for each group.
+ * {@link #attach} it, then add groups.
  */
 public final class RaftHost implements MessageHandler, AutoCloseable {
 
-    /** Segment files roll at 64 MiB (SPEC §6.2). */
+    /** Segment files roll at 64 MiB (SPEC §3.7). */
     public static final long SEGMENT_BYTES = 64L * 1024 * 1024;
+    /** Sessions expire after an hour of log time. */
+    public static final Duration SESSION_TIMEOUT = Duration.ofHours(1);
 
     private final NodeId self;
     private final Disk disk;
@@ -58,38 +56,38 @@ public final class RaftHost implements MessageHandler, AutoCloseable {
     private final Clock clock;
     private final Tracer tracer;
     private final Consumer<Throwable> onFatal;
-    private final Map<GroupId, Group> groups = new ConcurrentHashMap<>();
-    private volatile Transport transport;
+    private final MessageRouter router = new MessageRouter();
+    private final Map<GroupId, OwnedLoop> loops = new ConcurrentHashMap<>();
 
-    /** One group's parts. Owns its event loop (created here, closed in {@link RaftHost#close}). */
-    private static final class Group {
-        final GroupId id;
+    /** A group's event loop thread, created and owned here (closed in {@link RaftHost#close}). */
+    private static final class OwnedLoop {
         final EventLoopScheduler loop;
-        final KVStateMachine store = new KVStateMachine();
-        volatile RaftLog log;          // set once by addGroup, before the node starts
-        volatile RaftNode node;
-        volatile KVServer server;
 
-        Group(GroupId id, String threadName, Consumer<Throwable> onFatal) {
-            this.id = id;
-            this.loop = new EventLoopScheduler(threadName, onFatal);
+        OwnedLoop(String name, Consumer<Throwable> onFatal) {
+            this.loop = new EventLoopScheduler(name, onFatal);
         }
     }
+    private volatile Transport transport;
 
     /**
      * A snapshot of one group's state, for status commands and tests.
      *
-     * @param leader the leader this node knows of, possibly itself
+     * @param leader      the leader this node knows of, possibly itself
+     * @param keys        keys stored in this replica (for a data group: in the shards it serves)
+     * @param configNum   for a shard data group, the configuration it has applied; for the
+     *                    controller, the latest configuration; -1 otherwise
+     * @param shardsServing for a data group, how many shards it serves (SERVING or GCING); -1 otherwise
+     * @param shardsMoving  for a data group, shards PULLING or BEPULLING; -1 otherwise
      */
     public record GroupStatus(GroupId group, NodeId node, Role role, long term, Optional<NodeId> leader,
-                              long commitIndex, long lastApplied, long lastLogIndex, int keys) {
+                              long commitIndex, long lastApplied, long lastLogIndex, long snapshotIndex, int keys,
+                              long configNum, int shardsServing, int shardsMoving) {
     }
 
     /**
      * @param dataDir root data directory; group {@code g} lives in {@code dataDir/group-g}
-     * @param tracer  receives Raft events (each line already names the node, group, term and role)
      * @param onFatal called (on the event loop) if a group hits an unrecoverable error such as a
-     *                failed fsync; the process should stop (fail-stop, SPEC §6.4)
+     *                failed fsync; the process should stop (fail-stop)
      */
     public RaftHost(NodeId self, Disk disk, Path dataDir, Clock clock, Tracer tracer, Consumer<Throwable> onFatal) {
         this.self = Objects.requireNonNull(self, "self");
@@ -100,7 +98,7 @@ public final class RaftHost implements MessageHandler, AutoCloseable {
         this.onFatal = Objects.requireNonNull(onFatal, "onFatal");
     }
 
-    /** Sets the transport used for every group. Must be called once, before {@link #addGroup}. */
+    /** Sets the transport used for every group. Must be called once, before adding groups. */
     public void attach(Transport t) {
         if (transport != null) {
             throw new IllegalStateException("transport already attached");
@@ -109,86 +107,111 @@ public final class RaftHost implements MessageHandler, AutoCloseable {
             throw new IllegalArgumentException("transport is for " + t.self() + ", host is " + self);
         }
         transport = t;
+        router.attach(t);
+    }
+
+    /** Adds a single, unsharded KV group (Milestone 7 style). */
+    public void addKvGroup(GroupId group, Set<NodeId> voters, RaftConfig config) {
+        addGroup(group, voters, config, p -> Replicas.kv(p, SESSION_TIMEOUT));
+    }
+
+    /** Adds this node's replica of the shard controller (group 0). */
+    public void addControllerGroup(Set<NodeId> voters, int numShards, RaftConfig config) {
+        addGroup(GroupId.CONTROLLER, voters, config, p -> Replicas.controller(p, numShards, SESSION_TIMEOUT));
+    }
+
+    /** Adds this node's replica of data group {@code gid} of the sharded cluster. */
+    public void addShardGroup(int gid, Set<NodeId> voters, int numShards, List<NodeId> controllerServers, RaftConfig config) {
+        addGroup(GroupId.of(gid), voters, config, p -> Replicas.shard(p, numShards, SESSION_TIMEOUT, controllerServers, router));
     }
 
     /**
-     * Opens (or creates) the storage of {@code group}, recovers it, and starts its Raft node.
-     * Returns when the node is running.
+     * Opens (or creates) the group's storage, recovers it, and starts its replica. Returns when
+     * the replica is running.
      */
-    public void addGroup(GroupId group, Set<NodeId> voters, RaftConfig config) {
+    private void addGroup(GroupId group, Set<NodeId> voters, RaftConfig config, Function<Replicas.Parts, GroupReplica> build) {
         Transport t = Objects.requireNonNull(transport, "attach a transport first");
-        if (groups.containsKey(group)) {
+        if (router.replica(group).isPresent()) {
             throw new IllegalStateException(group + " already added");
         }
         Path dir = dataDir.resolve("group-" + group.value());
         disk.createDirectories(dir);
-        Group g = new Group(group, "raftkv-" + self + "-" + group, onFatal);
-        groups.put(group, g); // messages arriving before start() are ignored (see onMessage)
+        OwnedLoop owned = new OwnedLoop("raftkv-" + self + "-" + group, onFatal);
+        EventLoopScheduler loop = owned.loop;
+        SegmentedFileLog log = null;
         try {
-            FileMetaStore meta = new FileMetaStore(disk, dir);
-            g.log = SegmentedFileLog.open(disk, dir.resolve("log"), SEGMENT_BYTES);
-            g.node = RaftNode.builder()
-                    .self(self)
-                    .group(group)
-                    .voters(voters)
-                    .config(config)
-                    .scheduler(g.loop)
-                    .clock(clock)
-                    .random(new Random())
-                    .transport(t)
-                    .log(g.log)
-                    .metaStore(meta)
-                    .stateMachine(g.store)
-                    .tracer(tracer)
-                    .build();
-            g.server = new KVServer(g.node, t, clock);
-            onLoop(g, g.node::start).join();
+            log = SegmentedFileLog.open(disk, dir.resolve("log"), SEGMENT_BYTES);
+            Replicas.Parts parts = new Replicas.Parts(self, group, voters, config, loop, clock, new Random(), t, log,
+                    new FileMetaStore(disk, dir), new FileSnapshotStore(disk, dir), tracer);
+            GroupReplica replica = build.apply(parts);
+            router.add(replica); // messages that arrive before start() are ignored (the node isn't running)
+            loops.put(group, owned);
+            onLoop(loop, replica::start).join();
         } catch (RuntimeException e) {
-            groups.remove(group);
-            g.loop.close();
-            if (g.log != null) {
-                g.log.close();
+            router.remove(group);
+            loops.remove(group);
+            owned.loop.close();
+            if (log != null) {
+                log.close();
             }
             throw e;
         }
     }
 
-    /** Routes one incoming message to its group's event loop (called on the transport thread). */
+    /** Routes one incoming message (called on the transport thread). */
     @Override
     public void onMessage(Envelope envelope) {
-        Group g = groups.get(envelope.group());
-        if (g == null) {
-            if (envelope.message() instanceof ClientRequest request && transport != null) {
-                transport.send(envelope.from(), envelope.group(),
-                        new ClientReply(request.sequence(), ClientStatus.WRONG_GROUP, null, Bytes.EMPTY));
-            }
-            return;
-        }
-        g.loop.execute(() -> {
-            if (g.node == null || !g.node.isRunning()) {
-                return;
-            }
-            if (envelope.message() instanceof RaftMessage) {
-                g.node.handle(envelope);
-            } else if (envelope.message() instanceof ClientRequest) {
-                g.server.handle(envelope);
-            }
-        });
+        router.onMessage(envelope);
+    }
+
+    /** The router, e.g. to register an in-process client for its replies. */
+    public MessageRouter router() {
+        return router;
     }
 
     /** The current state of {@code group} on this node (read on its event loop). */
     public CompletableFuture<GroupStatus> status(GroupId group) {
-        Group g = groups.get(group);
-        if (g == null) {
+        Optional<GroupReplica> r = router.replica(group);
+        if (r.isEmpty()) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("no " + group + " on " + self));
         }
+        GroupReplica replica = r.get();
         CompletableFuture<GroupStatus> result = new CompletableFuture<>();
-        g.loop.execute(() -> {
-            RaftNode n = g.node;
-            result.complete(new GroupStatus(group, self, n.role(), n.currentTerm(), n.leaderId(),
-                    n.commitIndex(), n.lastApplied(), n.log().lastIndex(), g.store.size()));
+        replica.scheduler().execute(() -> {
+            try {
+                result.complete(describe(replica));
+            } catch (RuntimeException e) {
+                result.completeExceptionally(e);
+            }
         });
         return result;
+    }
+
+    private GroupStatus describe(GroupReplica replica) {
+        RaftNode n = replica.node();
+        int keys = 0;
+        long configNum = -1;
+        int serving = -1;
+        int moving = -1;
+        switch (replica.stateMachine()) {
+            case KVStateMachine kv -> keys = kv.size();
+            case ControllerStateMachine c -> configNum = c.latest().num();
+            case ShardKVStateMachine s -> {
+                configNum = s.current().num();
+                serving = s.shardsIn(ShardStatus.SERVING).size() + s.shardsIn(ShardStatus.GCING).size();
+                moving = s.shardsIn(ShardStatus.PULLING).size() + s.shardsIn(ShardStatus.BEPULLING).size();
+                for (int shard = 0; shard < s.numShards(); shard++) {
+                    if (s.status(shard).serves()) {
+                        keys += s.shardData(shard).map(d -> d.size()).orElse(0);
+                    }
+                }
+            }
+            default -> {
+                // unknown state machine: no details
+            }
+        }
+        return new GroupStatus(replica.group(), self, n.role(), n.currentTerm(), n.leaderId(), n.commitIndex(),
+                n.lastApplied(), n.log().lastIndex(), n.log().snapshotIndex(), keys, configNum, serving, moving);
     }
 
     public NodeId self() {
@@ -196,29 +219,35 @@ public final class RaftHost implements MessageHandler, AutoCloseable {
     }
 
     public List<GroupId> groups() {
-        return groups.keySet().stream().sorted().toList();
+        return router.replicas().keySet().stream().sorted().toList();
     }
 
-    /** Stops every group: stops the Raft node, closes its log, stops its event loop. */
+    /** Stops every group: stops its replica, closes its log, stops its event loop. */
     @Override
     public void close() {
-        for (Group g : groups.values()) {
-            try {
-                onLoop(g, () -> {
-                    g.node.stop();
-                    g.log.close();
-                }).join();
-            } catch (RuntimeException e) {
-                tracer.trace(self + "/" + g.id + " error while stopping: " + e);
+        for (Map.Entry<GroupId, GroupReplica> e : router.replicas().entrySet()) {
+            GroupReplica replica = e.getValue();
+            OwnedLoop owned = loops.remove(e.getKey());
+            if (owned == null) {
+                continue;
             }
-            g.loop.close();
+            EventLoopScheduler loop = owned.loop;
+            try {
+                onLoop(loop, () -> {
+                    replica.stop();
+                    replica.log().close();
+                }).join();
+            } catch (RuntimeException ex) {
+                tracer.trace(self + "/" + e.getKey() + " error while stopping: " + ex);
+            }
+            loop.close();
+            router.remove(e.getKey());
         }
-        groups.clear();
     }
 
-    private static CompletableFuture<Void> onLoop(Group g, Runnable task) {
+    private static CompletableFuture<Void> onLoop(EventLoopScheduler loop, Runnable task) {
         CompletableFuture<Void> done = new CompletableFuture<>();
-        g.loop.execute(() -> {
+        loop.execute(() -> {
             try {
                 task.run();
                 done.complete(null);

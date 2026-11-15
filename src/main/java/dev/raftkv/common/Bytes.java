@@ -65,6 +65,15 @@ public final class Bytes implements Comparable<Bytes> {
         return data[index];
     }
 
+    /** A copy of {@code length} bytes starting at {@code offset}. */
+    public Bytes slice(int offset, int length) {
+        Objects.checkFromIndexSize(offset, length, data.length);
+        if (offset == 0 && length == data.length) {
+            return this;
+        }
+        return length == 0 ? EMPTY : new Bytes(Arrays.copyOfRange(data, offset, offset + length));
+    }
+
     /** A fresh copy of the contents. */
     public byte[] toArray() {
         return data.clone();

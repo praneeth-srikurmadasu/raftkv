@@ -9,6 +9,8 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.BiConsumer;
 
+import dev.raftkv.codec.BinaryReader;
+import dev.raftkv.codec.BinaryWriter;
 import dev.raftkv.codec.CodecException;
 import dev.raftkv.common.Bytes;
 import dev.raftkv.common.Hashing;
@@ -38,8 +40,10 @@ public final class KVStateMachine implements StateMachine {
     /** How often (in log time) idle sessions are swept. */
     private static final long EXPIRY_SWEEP_MILLIS = 1_000;
 
+    private static final byte SNAPSHOT_VERSION = 1;
+
     private final TreeMap<Bytes, Bytes> data = new TreeMap<>();
-    private final SessionTable sessions = new SessionTable();
+    private SessionTable sessions = new SessionTable();
     private final long sessionTimeoutMillis;
     private final Set<Bug> bugs;
     private long logTimeMillis;
@@ -75,35 +79,22 @@ public final class KVStateMachine implements StateMachine {
     }
 
     /**
-     * The exactly-once rules (thesis §6.3):
-     * <ul>
-     *   <li>Unknown client with {@code ackedBelow == 1}: a new session. Nothing can have been
-     *       forgotten yet, so it is safe to start one.</li>
-     *   <li>Unknown client with {@code ackedBelow > 1}: the client has received replies, so we
-     *       once had its session and have since expired it. We can no longer tell whether this
-     *       request already ran, so we must not run it: SESSION_EXPIRED.</li>
-     *   <li>{@code sequence < ackedBelow}: the client already has this reply (a stale duplicate).</li>
-     *   <li>Result cached for this sequence: a retry. Return the cached result; do not execute.</li>
-     *   <li>Otherwise: execute, cache, return.</li>
-     * </ul>
+     * The exactly-once rules (thesis §6.3), see {@link SessionTable#admit}. The single-group store
+     * uses strict new sessions: an unknown client with {@code ackedBelow > 1} must have had a
+     * session that expired, so its request may already have run and is refused (SESSION_EXPIRED).
      */
     private Bytes applySession(SessionCommand sc) {
-        SessionTable.Session session = sessions.get(sc.clientId()).orElse(null);
-        if (session == null) {
-            if (sc.ackedBelow() > 1) {
+        SessionTable.Admission a = sessions.admit(sc.clientId(), sc.sequence(), sc.ackedBelow(), logTimeMillis,
+                true, !bugs.contains(Bug.SESSION_DEDUP_DISABLED));
+        switch (a.verdict()) {
+            case EXPIRED -> {
                 return outcome(ClientStatus.SESSION_EXPIRED, Bytes.EMPTY);
             }
-            session = sessions.create(sc.clientId(), logTimeMillis);
-        }
-        session.lastActiveMillis = logTimeMillis;
-        SessionTable.acknowledge(session, sc.ackedBelow());
-        if (sc.sequence() < session.ackedBelow) {
-            return outcome(ClientStatus.SESSION_EXPIRED, Bytes.EMPTY);
-        }
-        if (!bugs.contains(Bug.SESSION_DEDUP_DISABLED)) {
-            Bytes cached = session.results.get(sc.sequence());
-            if (cached != null) {
-                return cached; // a retry: same answer, no second execution
+            case CACHED -> {
+                return a.cached(); // a retry: same answer, no second execution
+            }
+            case EXECUTE -> {
+                // handled below
             }
         }
         KVCommand command;
@@ -115,7 +106,7 @@ public final class KVStateMachine implements StateMachine {
         Bytes result = outcome(ClientStatus.OK, KVCodec.encode(execute(command)));
         executed++;
         executionObserver.accept(sc.clientId(), sc.sequence());
-        session.results.put(sc.sequence(), result);
+        sessions.recordResult(sc.clientId(), sc.sequence(), result);
         return result;
     }
 
@@ -137,6 +128,50 @@ public final class KVStateMachine implements StateMachine {
 
     private static Bytes outcome(ClientStatus status, Bytes result) {
         return KVCodec.encode(new KVCodec.Outcome(status, result));
+    }
+
+    // ------------------------------------------------------------------ snapshots
+
+    /** Format: version, logical time, sweep time, executed count, entries, sessions. */
+    @Override
+    public Bytes snapshot() {
+        BinaryWriter w = new BinaryWriter();
+        w.writeByte(SNAPSHOT_VERSION);
+        w.writeLong(logTimeMillis);
+        w.writeLong(nextSweepMillis);
+        w.writeLong(executed);
+        w.writeInt(data.size());
+        for (Map.Entry<Bytes, Bytes> e : data.entrySet()) {
+            w.writeBytes(e.getKey());
+            w.writeBytes(e.getValue());
+        }
+        sessions.writeTo(w);
+        return w.toBytes();
+    }
+
+    @Override
+    public void restore(Bytes snapshot) {
+        BinaryReader r = new BinaryReader(snapshot);
+        if (r.readByte() != SNAPSHOT_VERSION) {
+            throw new CodecException("unknown KV snapshot version");
+        }
+        long time = r.readLong();
+        long sweep = r.readLong();
+        long exec = r.readLong();
+        int count = SessionTable.readCount(r, 8);
+        TreeMap<Bytes, Bytes> restored = new TreeMap<>();
+        for (int i = 0; i < count; i++) {
+            restored.put(r.readBytes(), r.readBytes());
+        }
+        SessionTable table = SessionTable.readFrom(r);
+        r.expectEnd();
+        // Only replace state once the whole snapshot decoded cleanly.
+        logTimeMillis = time;
+        nextSweepMillis = sweep;
+        executed = exec;
+        data.clear();
+        data.putAll(restored);
+        sessions = table;
     }
 
     // ------------------------------------------------------------------ inspection

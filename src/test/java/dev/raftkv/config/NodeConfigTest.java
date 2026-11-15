@@ -35,7 +35,7 @@ class NodeConfigTest {
 
     @Test
     void peersComeOutInIdOrderWhateverTheInputOrder() {
-        NodeConfig c = NodeConfig.parse("--id", "1", "--peers", "3=h:3, 1=h:1 ,2=h:2");
+        NodeConfig c = NodeConfig.parse("--id", "1", "--peers", "3=127.0.0.1:3, 1=127.0.0.1:1 ,2=127.0.0.1:2");
         assertThat(c.peers().keySet().toString()).isEqualTo("[n1, n2, n3]");
     }
 
@@ -55,8 +55,8 @@ class NodeConfigTest {
         assertThatThrownBy(() -> NodeConfig.parse("--id", "1", "--peers", PEERS, "--bogus")).hasMessageContaining("unknown argument");
         assertThatThrownBy(() -> NodeConfig.parse("--id", "1", "--peers")).hasMessageContaining("needs a value");
         assertThatThrownBy(() -> NodeConfig.parse("--id", "1", "--id", "1", "--peers", PEERS)).hasMessageContaining("given twice");
-        assertThatThrownBy(() -> NodeConfig.parsePeers("1=h:1,1=h:2")).hasMessageContaining("listed twice");
-        assertThatThrownBy(() -> NodeConfig.parsePeers("1:h:1")).hasMessageContaining("id=host:port");
+        assertThatThrownBy(() -> NodeConfig.parsePeers("1=127.0.0.1:1,1=127.0.0.1:2")).hasMessageContaining("listed twice");
+        assertThatThrownBy(() -> NodeConfig.parsePeers("1:127.0.0.1:1")).hasMessageContaining("id=host:port");
         assertThatThrownBy(() -> NodeConfig.parseAddress("host")).hasMessageContaining("host:port");
         assertThatThrownBy(() -> NodeConfig.parseAddress("host:70000")).hasMessageContaining("out of range");
     }

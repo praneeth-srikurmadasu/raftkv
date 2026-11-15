@@ -26,6 +26,9 @@ import dev.raftkv.protocol.ClientRequest;
 import dev.raftkv.raft.log.LogEntry;
 import dev.raftkv.raft.log.SegmentedFileLog;
 import dev.raftkv.raft.storage.FileMetaStore;
+import dev.raftkv.raft.storage.FileSnapshotStore;
+import dev.raftkv.raft.storage.InMemorySnapshotStore;
+import dev.raftkv.raft.storage.SnapshotStore;
 import dev.raftkv.raft.storage.InMemoryMetaStore;
 import dev.raftkv.raft.storage.MetaStore;
 import dev.raftkv.raft.storage.PersistentState;
@@ -73,6 +76,7 @@ final class SimulatedCluster {
 
     final Storage storage;
     private final Map<NodeId, MetaStore> metaStores = new TreeMap<>();
+    private final Map<NodeId, SnapshotStore> snapshotStores = new TreeMap<>();
     private final Map<NodeId, SimulatedDisk> disks = new TreeMap<>();
     private final Map<NodeId, TrackingLog> logs = new TreeMap<>();
     private final Map<NodeId, RecordingStateMachine> stateMachines = new TreeMap<>();
@@ -120,6 +124,9 @@ final class SimulatedCluster {
                      Storage storage) {
         this.storage = storage;
         this.sim = new Simulation(seed);
+        if (Boolean.getBoolean("raftkv.trace")) {
+            sim.echoTraceTo(System.out::println); // -Draftkv.trace=true with -Draftkv.seed=S prints every event
+        }
         this.net = new SimulatedNetwork(sim);
         this.config = config;
         List<NodeId> list = new ArrayList<>();
@@ -139,6 +146,7 @@ final class SimulatedCluster {
                 log.sync();
             } else {
                 metaStores.put(id, new InMemoryMetaStore(new PersistentState(initialTerm, null)));
+                snapshotStores.put(id, new InMemorySnapshotStore());
                 logs.put(id, new TrackingLog(initialLogs.getOrDefault(id, List.of())));
             }
             // The handler looks up whichever RaftNode currently runs as this id.
@@ -194,6 +202,7 @@ final class SimulatedCluster {
                 .transport(transports.get(id))
                 .log(logs.get(id))
                 .metaStore(metaStores.get(id))
+                .snapshotStore(snapshotStores.get(id))
                 .stateMachine(sm)
                 .tracer(sim)
                 .build();
@@ -237,6 +246,7 @@ final class SimulatedCluster {
         SimulatedDisk disk = disks.get(id);
         Path dir = Path.of("/data/n" + id.value());
         metaStores.put(id, new FileMetaStore(disk, dir));
+        snapshotStores.put(id, new FileSnapshotStore(disk, dir));
         logs.put(id, new TrackingLog(SegmentedFileLog.open(disk, dir.resolve("log"), SEGMENT_BYTES)));
     }
 
@@ -297,6 +307,10 @@ final class SimulatedCluster {
         return metaStores.get(id);
     }
 
+    SnapshotStore snapshotStore(NodeId id) {
+        return snapshotStores.get(id);
+    }
+
     TrackingLog log(NodeId id) {
         return logs.get(id);
     }
@@ -316,7 +330,7 @@ final class SimulatedCluster {
 
     /**
      * Runs until every running node has applied exactly the same prefix of the log, and that
-     * prefix is everything the current leader has committed. Use this before comparing replica
+     * prefix is the current leader's whole log, all of it committed. Use this before comparing replica
      * states: comparing at different log positions is meaningless (a late duplicate entry may
      * still be on its way to one of them).
      */
@@ -331,7 +345,11 @@ final class SimulatedCluster {
                 }
             }
             long at = applied;
-            return leaders().stream().anyMatch(l -> l.commitIndex() == at);
+            // The leader must also have committed its whole log. A new leader starts with the
+            // commitIndex it had as a follower and can't advance it until its no-op commits, so
+            // "everyone applied what the leader has committed" alone can stop one entry short of
+            // a write the previous leader already acknowledged (KVChaos seed -8730329895450152434).
+            return leaders().stream().anyMatch(l -> l.commitIndex() == at && l.log().lastIndex() == at);
         }, max);
         if (!ok) {
             throw new AssertionError("replicas did not converge to the same applied index within " + max

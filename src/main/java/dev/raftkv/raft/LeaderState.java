@@ -19,6 +19,26 @@ final class LeaderState {
 
     private final Map<NodeId, Long> nextIndex = new TreeMap<>();
     private final Map<NodeId, Long> matchIndex = new TreeMap<>();
+    private final Map<NodeId, SnapshotTransfer> transfers = new TreeMap<>();
+
+    /**
+     * An InstallSnapshot transfer in progress to one follower. Up to a window of chunks is in
+     * flight; each confirmation opens the window further. The follower accepts chunks only in
+     * order, so after a lost chunk the leader goes back to the last confirmed offset (on the next
+     * heartbeat) and resends from there ("go-back-N").
+     */
+    static final class SnapshotTransfer {
+        final dev.raftkv.raft.storage.Snapshot snapshot;
+        /** Bytes the follower has confirmed. */
+        long acked;
+        /** Where the next chunk to send starts ({@code >= acked}). */
+        long sent;
+        long lastSentNanos = Long.MIN_VALUE;
+
+        SnapshotTransfer(dev.raftkv.raft.storage.Snapshot snapshot) {
+            this.snapshot = snapshot;
+        }
+    }
 
     LeaderState(Iterable<NodeId> peers, long leaderLastIndex) {
         for (NodeId p : peers) {
@@ -47,6 +67,20 @@ final class LeaderState {
         long match = Math.max(matchIndex.get(peer), index);
         matchIndex.put(peer, match);
         nextIndex.put(peer, Math.max(nextIndex.get(peer), match + 1));
+    }
+
+    SnapshotTransfer transfer(NodeId peer) {
+        return transfers.get(peer);
+    }
+
+    SnapshotTransfer startTransfer(NodeId peer, dev.raftkv.raft.storage.Snapshot snapshot) {
+        SnapshotTransfer t = new SnapshotTransfer(snapshot);
+        transfers.put(peer, t);
+        return t;
+    }
+
+    void endTransfer(NodeId peer) {
+        transfers.remove(peer);
     }
 
     Iterable<Long> matchIndexes() {

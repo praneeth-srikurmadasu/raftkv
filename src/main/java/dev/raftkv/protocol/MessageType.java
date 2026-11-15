@@ -15,7 +15,11 @@ public enum MessageType {
     INSTALL_SNAPSHOT_REPLY((short) 6),
     TIMEOUT_NOW((short) 7),
     CLIENT_REQUEST((short) 100),
-    CLIENT_REPLY((short) 101);
+    CLIENT_REPLY((short) 101),
+    FETCH_SHARD((short) 110),
+    FETCH_SHARD_REPLY((short) 111),
+    DELETE_SHARD((short) 112),
+    DELETE_SHARD_REPLY((short) 113);
 
     private final short code;
 

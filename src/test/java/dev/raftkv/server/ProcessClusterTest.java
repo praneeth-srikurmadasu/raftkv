@@ -26,10 +26,11 @@ import dev.raftkv.client.cli.RaftKVCli;
 import dev.raftkv.common.NodeId;
 
 /**
- * Milestone 7 gate, part 2: three real server processes ({@code java dev.raftkv.Main}), the
- * way the run-cluster scripts start them. The leader process is killed with no warning
- * ({@code destroyForcibly}, like {@code kill -9} or Task Manager's "End task"), twice, and
- * every acknowledged write must still be readable.
+ * Milestone 7 gate, part 2 (and the sharded cluster since Milestone 10): three real server
+ * processes ({@code java dev.raftkv.Main}, each hosting the controller and three data groups), the
+ * way the run-cluster scripts start them. The process leading group 1 is killed with no warning
+ * ({@code destroyForcibly}, like {@code kill -9} or Task Manager's "End task"), twice, a shard is
+ * moved, and every acknowledged write must still be readable.
  */
 class ProcessClusterTest {
 
@@ -49,18 +50,22 @@ class ProcessClusterTest {
             try (RaftKVCli cli = new RaftKVCli(addresses, Duration.ofSeconds(30))) {
                 List<String> written = new ArrayList<>();
                 write(cli, "first", written);
-                NodeId firstLeader = cli.client().knownLeader().orElseThrow();
+                NodeId firstLeader = cli.client().knownLeader(1).orElseThrow();
 
                 kill(firstLeader);
                 write(cli, "second", written);
-                NodeId secondLeader = cli.client().knownLeader().orElseThrow();
+                NodeId secondLeader = cli.client().knownLeader(1).orElseThrow();
                 assertThat(secondLeader).isNotEqualTo(firstLeader);
 
                 launch(firstLeader);   // comes back from its data directory
                 write(cli, "third", written);
                 kill(secondLeader);    // now the restarted node is needed for a majority
                 write(cli, "fourth", written);
-                assertThat(cli.client().knownLeader().orElseThrow()).isNotEqualTo(secondLeader);
+                assertThat(cli.client().knownLeader(1).orElseThrow()).isNotEqualTo(secondLeader);
+
+                // Move a shard while a node is down and the leader changed twice: data must follow.
+                int moved = cli.client().controller().move(0, 2).join().gidOf(0);
+                assertThat(moved).isEqualTo(2);
 
                 for (String key : written) {
                     assertThat(cli.client().get(key)).as("key %s", key).isEqualTo(Optional.of("value-" + key));

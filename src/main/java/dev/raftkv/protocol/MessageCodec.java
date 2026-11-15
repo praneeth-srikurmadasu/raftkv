@@ -77,7 +77,12 @@ public final class MessageCodec {
                 w.writeBytes(m.data());
                 w.writeBoolean(m.done());
             }
-            case InstallSnapshotReply m -> w.writeLong(m.term());
+            case InstallSnapshotReply m -> {
+                w.writeLong(m.term());
+                w.writeLong(m.lastIncludedIndex());
+                w.writeLong(m.nextOffset());
+                w.writeBoolean(m.installed());
+            }
             case TimeoutNow m -> {
                 w.writeLong(m.term());
                 writeNodeId(w, m.leaderId());
@@ -90,11 +95,33 @@ public final class MessageCodec {
                 w.writeBytes(m.command());
             }
             case ClientReply m -> {
+                w.writeLong(m.clientId().getMostSignificantBits());
+                w.writeLong(m.clientId().getLeastSignificantBits());
                 w.writeLong(m.sequence());
                 w.writeByte(m.status().code());
                 w.writeBoolean(m.leaderHint() != null);
                 w.writeInt(m.leaderHint() != null ? m.leaderHint().value() : 0);
                 w.writeBytes(m.result());
+            }
+            case FetchShard m -> {
+                w.writeLong(m.configNum());
+                w.writeInt(m.requesterGroup());
+                writeShards(w, m.shards());
+            }
+            case FetchShardReply m -> {
+                w.writeLong(m.configNum());
+                w.writeBoolean(m.ready());
+                w.writeBytes(m.shards());
+            }
+            case DeleteShard m -> {
+                w.writeLong(m.configNum());
+                w.writeInt(m.requesterGroup());
+                writeShards(w, m.shards());
+            }
+            case DeleteShardReply m -> {
+                w.writeLong(m.configNum());
+                w.writeBoolean(m.done());
+                writeShards(w, m.shards());
             }
         }
         return w.toBytes();
@@ -120,11 +147,15 @@ public final class MessageCodec {
                         r.readLong(), r.readLong());
                 case INSTALL_SNAPSHOT -> new InstallSnapshot(r.readLong(), readNodeId(r), r.readLong(), r.readLong(),
                         r.readLong(), r.readBytes(), r.readBoolean());
-                case INSTALL_SNAPSHOT_REPLY -> new InstallSnapshotReply(r.readLong());
+                case INSTALL_SNAPSHOT_REPLY -> new InstallSnapshotReply(r.readLong(), r.readLong(), r.readLong(), r.readBoolean());
                 case TIMEOUT_NOW -> new TimeoutNow(r.readLong(), readNodeId(r));
                 case CLIENT_REQUEST -> new ClientRequest(new UUID(r.readLong(), r.readLong()), r.readLong(), r.readLong(),
                         r.readBytes());
                 case CLIENT_REPLY -> decodeClientReply(r);
+                case FETCH_SHARD -> new FetchShard(r.readLong(), r.readInt(), readShards(r));
+                case FETCH_SHARD_REPLY -> new FetchShardReply(r.readLong(), r.readBoolean(), r.readBytes());
+                case DELETE_SHARD -> new DeleteShard(r.readLong(), r.readInt(), readShards(r));
+                case DELETE_SHARD_REPLY -> new DeleteShardReply(r.readLong(), r.readBoolean(), readShards(r));
             };
         } catch (IllegalArgumentException e) {
             // A record constructor rejected the values: the bytes were well-formed but meaningless.
@@ -143,11 +174,12 @@ public final class MessageCodec {
     // the one-line decoders above read the fields in the order they were written.
 
     private static ClientReply decodeClientReply(BinaryReader r) {
+        UUID clientId = new UUID(r.readLong(), r.readLong());
         long sequence = r.readLong();
         ClientStatus status = ClientStatus.fromCode(r.readByte());
         boolean hasHint = r.readBoolean();
         int hint = r.readInt();
-        return new ClientReply(sequence, status, hasHint ? new NodeId(hint) : null, r.readBytes());
+        return new ClientReply(clientId, sequence, status, hasHint ? new NodeId(hint) : null, r.readBytes());
     }
 
     private static AppendEntries decodeAppendEntries(BinaryReader r) {
@@ -169,6 +201,25 @@ public final class MessageCodec {
     }
 
     // ------------------------------------------------------------------ shared pieces
+
+    private static void writeShards(BinaryWriter w, List<Integer> shards) {
+        w.writeInt(shards.size());
+        for (int s : shards) {
+            w.writeInt(s);
+        }
+    }
+
+    private static List<Integer> readShards(BinaryReader r) {
+        int count = r.readInt();
+        if (count < 0 || count > r.remaining() / 4) {
+            throw new CodecException("invalid shard count " + count);
+        }
+        List<Integer> shards = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            shards.add(r.readInt());
+        }
+        return shards;
+    }
 
     private static void writeNodeId(BinaryWriter w, NodeId id) {
         w.writeInt(id.value());

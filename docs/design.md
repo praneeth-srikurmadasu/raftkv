@@ -24,9 +24,13 @@ This document grows with every milestone. It records **what** we built, **why** 
 
 ```
  Main / client.cli   process entry points (server, command-line client)
- server     RaftHost                           groups of one process; routes by group id to each group's thread
- kv         KVServer, KVStateMachine, sessions client requests ⇄ Raft proposals
- raft       RaftNode, log/, storage/           the consensus core (single-threaded)
+ config     NodeConfig, ClusterBootstrap       options; first configuration of a new cluster
+ server     RaftHost, MessageRouter, Replicas  many groups per process; routes by group id to each group's thread
+ shard      controller, ShardKVStateMachine,   configs + rebalancing (group 0); shard statuses, migration, GC
+            ShardKVServer, ShardedKVClient     (data groups); key → shard → group routing (clients)
+ client     SessionClient, RaftKVClient        sessions, retries, leader discovery
+ kv         KVServer, KVStateMachine, sessions client requests ⇄ Raft proposals (single-group mode)
+ raft       RaftNode, log/, storage/           the consensus core (single-threaded), snapshots
  protocol   sealed Message + MessageCodec      frames ⇄ messages
  codec      BinaryWriter/Reader, FrameCodec    bytes  ⇄ frames
  transport  Transport ── SimulatedNetwork | NioTransport
@@ -123,6 +127,41 @@ This document grows with every milestone. It records **what** we built, **why** 
 | Fatal errors | Event-loop error handler halts the process (fail-stop) | Log and continue | After a failed fsync the on-disk state is unknown; restart and recover instead. |
 | Client node ids | Random id ≥ 2²⁴ announced in the handshake | Separate client protocol | Same framing and code path as peers; ids can't collide with server ids in practice. |
 
+### Key decisions (Milestone 8)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Trigger | `snapshotThreshold` applied entries not yet covered (default 10,000; 0 = off) | Log size in bytes | Simple, deterministic in simulation; bytes can be added with metrics. |
+| Order of operations | serialize → save durably → only then `compactPrefix` | Compact first | A crash in between must never lose committed entries. |
+| Storage | One file per group, tmp → fsync → rename → fsync dir; CRC32C; corruption is fatal | Keep N old snapshots | The log prefix is gone once compacted, so a bad snapshot can't be repaired from a local fallback anyway; the next InstallSnapshot from a leader can. |
+| Recovery | Load snapshot, keep log entries after it if `(index, term)` matches, otherwise reset the log | Always reset | Keeps the tail a crash left behind. |
+| InstallSnapshot | Chunked by offset; next chunk only after the previous is acknowledged; follower accepts strictly in order | Pipeline chunks | Same "send more only on progress" rule that fixed message amplification in M3. |
+| Testing | `SnapshotSwarm`: every chaos suite snapshots at random tiny thresholds in 2/3 of seeds | Separate snapshot chaos test | Compaction then meets every fault the other suites inject. |
+
+### Key decisions (Milestone 9)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Partitioning | 64 fixed shards, FNV-1a 64 mod N | Consistent hashing; ranges | Explicit, tiny routing table; keys never change shard. Ranges are a stretch goal. |
+| Rebalancer | Pure function; the `N mod G` extra shards go to the groups holding the most (ties: lowest gid) | SPEC: extra shards to the lowest gids | Giving extras to the current largest holders is what makes the move count minimal; SPEC's rule can force needless moves. |
+| Controller ops | Join/Leave/Move/Query through group 0's log with sessions | Direct state reads | Exactly-once admin commands; Query is linearizable. |
+| Hosting | Every process hosts the controller and every data group (`--groups`) | Separate processes per group | Simplest real deployment; the simulator also runs separate layouts (group g on its own three nodes). |
+| Routing | `MessageRouter` by group id; same code in simulator and processes | Separate routing for real network | Chaos tests cover the production routing. |
+| Bootstrap | Lowest-id node joins all data groups once, through a session | Static config file | Exactly one initial configuration; later changes only via admin commands. |
+| Client | Cached config, cached leader per group; same sequence number on every retry, to any group | New sequence after WRONG_GROUP | Required for exactly-once across migrations (sessions move with shards). |
+
+### Key decisions (Milestone 10)
+
+| Decision | Choice | Alternatives considered | Why |
+|---|---|---|---|
+| Migration state | Shard statuses in the replicated state machine; poller and migrator derive work from them | Leader-memory work queues | A leader crash loses nothing; a new leader resumes. |
+| Config steps | Exactly `current + 1`, only when all shards are settled | Jump to latest | A shard that moved twice could be pulled from the wrong group. |
+| Data movement | Pull: new owner fetches from any replica of the old owner that applied the config | Push from old owner | Receiver drives retries; frozen (BEPULLING) data is identical on every replica. |
+| Idempotence | Every ShardOp carries its config number and is ignored unless it matches | Message dedup ids | Duplicates, retries and reordering are harmless by construction. |
+| GC | DeleteShard only after InsertShards is committed at the new owner; old owner deletes through its log; GcDone completes | Delete on fetch | Deleting earlier can lose the shard if the new leader crashes before the insert commits. |
+| Sessions | Per shard, migrated with the data | Global per group | Exactly-once survives a key moving between groups mid-retry. |
+| Ownership check | On arrival (cheap rejection) and again at apply (decisive) | Arrival only | A ConfigChange can land between arrival and commit. |
+
 ### Known limitation (until Milestone 11)
 A node that misses heartbeats (briefly partitioned) can time out right after it reconnects; its higher term then makes the healthy leader step down through Fig. 2's "higher term → follower" rule. Safety is unaffected, but it costs an election. Pre-vote removes this. The chaos test lets the group settle for 2 s after healing before checking stability.
 
@@ -133,11 +172,17 @@ A node that misses heartbeats (briefly partitioned) can time out right after it 
 3. **Correlation ids for Raft.** SPEC §5.2 describes request/response matching by correlation id. Raft messages don't use it (see "communication style" above); it remains in the frame for client RPCs.
 4. **Bug switches.** SPEC §9.6 describes `static final` flags enabled through a separate build profile. Instead, bugs are an `EnumSet` inside `RaftConfig` (`RaftConfig.defaults()` has none). This lets one test run compare buggy and correct code side by side with no special build, at the cost of one set lookup per guarded line. Only test code ever enables a bug.
 5. **Bug detection by targeted tests.** `COMMIT_INDEX_FROM_LAST_LOG_INDEX` is detected by a rule-level test, because this leader design never creates the situation where the bug does damage. `COMMIT_PREVIOUS_TERM_BY_COUNT` is detected by the scripted Figure 8 test, because random chaos reaches a Figure 8 shape too rarely to rely on (see docs/learning/03-log-replication.md §8).
-6. **Durable state machine.** The state machine is still rebuilt by replaying the log after a restart; persisting it is the job of snapshots (Milestone 8).
+6. **Durable state machine.** Until Milestone 8 the state machine was rebuilt by replaying the whole log after a restart. Since Milestone 8 it is restored from the latest snapshot plus the log after it.
 7. **No session registration.** SPEC §4.2 allows registering sessions through the log; clients instead pick a random 128-bit id and the first request (with `ackedBelow == 1`) creates the session. Losing a session is still detected (`ackedBelow > 1` on an unknown client → `SESSION_EXPIRED`).
 8. **RaftLog is not AutoCloseable.** It has a plain `close()` so IDEs don't flag every in-memory or node-owned log as a resource leak.
 9. **One listening port.** SPEC §5.2 suggests separate ports for peer and client RPCs. One port serves both; the handshake's node id tells them apart. A second port can be added when there's a reason (e.g. firewalling clients from peers).
 10. **No correlation-id request futures in the transport.** SPEC §5.2 describes request/response matching by correlation id inside the transport. The transport is one-way messaging; `RaftKVClient` already matches replies by sequence number and has its own timeouts, so frames carry correlation id 0.
 11. **Back-pressure drops instead of replying `OVERLOADED`.** Per-connection write queues are bounded (64 MiB), but a full queue drops frames rather than surfacing `OVERLOADED` to clients. Admission control comes with the performance work (Milestone 11).
 12. **fsync on the group's event loop.** SPEC §3.2 prefers slow work off the event loop. The log's group-commit flush runs on the group's own thread; with one group per process this costs nothing measurable. Moving fsync to a dedicated thread is part of Milestone 11.
-13. **Coalesced heartbeats** (SPEC §5.2 stretch goal) are deferred until there are many groups per process (Milestone 9+).
+13. **Coalesced heartbeats** (SPEC §5.2 stretch goal) are deferred. With 4 groups per process the extra heartbeats are negligible; they matter at hundreds of groups.
+14. **Snapshots serialize on the event loop.** SPEC §3.8 asks for a copy-on-write capture and background serialization. The group pauses while its state is copied (milliseconds for megabytes). Background snapshots come with the Milestone 11 performance work.
+15. **Incoming snapshot chunks are buffered in memory**, then saved with the same crash-safe write as local snapshots, instead of being appended to a temp file chunk by chunk. Memory is bounded by one snapshot.
+16. **Controller Query goes through the log.** SPEC §6.3 says ReadIndex; ReadIndex arrives in Milestone 11. Going through the log is also linearizable, just slower.
+17. **Rebalancer tie rule** differs from SPEC §6.3: the extra shards go to the groups that currently hold the most (lowest gid on ties) rather than always to the lowest gids, because that is what guarantees the minimum number of moves (see Milestone 9 decisions).
+18. **Real processes host every data group.** `Main` runs a replica of the controller and of each of `--groups` data groups on every process; `admin join` can only (re)add groups that the processes host. Groups on separate machine sets are exercised in the simulator. Placing groups on subsets of processes (and SPEC §9.7's 9-JVM Jepsen-lite) is part of Milestone 13.
+19. **Sharded gate is 2,000 seeds per build.** Matches SPEC §11; larger runs are done by hand with `-Draftkv.seeds` (2,500 seeds: 1.4M operations, 20,233 reconfigurations, all linearizable).

@@ -2,12 +2,15 @@ package dev.raftkv;
 
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-import dev.raftkv.common.GroupId;
+import dev.raftkv.common.NodeId;
 import dev.raftkv.common.SystemClock;
 import dev.raftkv.common.Tracer;
+import dev.raftkv.config.ClusterBootstrap;
 import dev.raftkv.config.NodeConfig;
 import dev.raftkv.io.RealDisk;
 import dev.raftkv.raft.RaftConfig;
@@ -15,7 +18,8 @@ import dev.raftkv.server.RaftHost;
 import dev.raftkv.transport.NioTransport;
 
 /**
- * Starts one RaftKV server process (Milestone 7: one Raft group, real TCP, real disk).
+ * Starts one RaftKV server process: a replica of the shard controller (group 0) and of every data
+ * group, over real TCP and real disks (Milestones 7–10).
  *
  * <pre>
  *   java -cp target/classes dev.raftkv.Main --id 1 --peers 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
@@ -32,9 +36,6 @@ public final class Main {
 
     /** Lowest Java feature release we support (records, sealed types, virtual threads, pattern switch). */
     public static final int MIN_JAVA_FEATURE = 21;
-
-    /** The single data group until sharding arrives (group 0 is reserved for the controller). */
-    public static final GroupId DATA_GROUP = GroupId.of(1);
 
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
 
@@ -84,7 +85,7 @@ public final class Main {
 
         try (RaftHost host = new RaftHost(config.id(), new RealDisk(), config.dataDir(), SystemClock.INSTANCE, log,
                      error -> {
-                         // Fail-stop (SPEC §6.4): after a failed fsync we no longer know what is on disk.
+                         // Fail-stop: after a failed fsync we no longer know what is on disk.
                          System.err.println("FATAL on " + config.id() + ": " + error);
                          error.printStackTrace();
                          Runtime.getRuntime().halt(1);
@@ -93,9 +94,20 @@ public final class Main {
             host.attach(transport);
             log.trace(banner());
             log.trace(config.id() + " listening on " + transport.localAddress() + ", data in "
-                    + config.dataDir().toAbsolutePath() + ", cluster " + config.peers().keySet());
-            host.addGroup(DATA_GROUP, config.peers().keySet(), RaftConfig.defaults());
-            shutdownRequested.await();
+                    + config.dataDir().toAbsolutePath() + ", cluster " + config.peers().keySet()
+                    + ", " + config.groups() + " data groups, " + config.shards() + " shards");
+            Set<NodeId> voters = config.peers().keySet();
+            List<NodeId> servers = List.copyOf(voters);
+            RaftConfig raft = RaftConfig.defaults();
+            host.addControllerGroup(voters, config.shards(), raft);
+            for (int gid = 1; gid <= config.groups(); gid++) {
+                host.addShardGroup(gid, voters, config.shards(), servers, raft);
+            }
+            try (ClusterBootstrap bootstrap = new ClusterBootstrap(config.id(), servers, config.groups(), transport,
+                    host.router(), SystemClock.INSTANCE, log)) {
+                bootstrap.start();
+                shutdownRequested.await();
+            }
             log.trace(config.id() + " shutting down");
         } finally {
             closed.countDown();

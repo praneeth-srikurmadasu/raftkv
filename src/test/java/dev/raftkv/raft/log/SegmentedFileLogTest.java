@@ -181,4 +181,121 @@ class SegmentedFileLogTest {
             assertThat(i <= history.size() && history.get((int) i - 1).contains(got)).as("seed %d: entry %d was never written: %s", seed, i, got).isTrue();
         }
     }
+
+    @Test
+    void compactionDeletesCoveredSegmentsOldestFirst() {
+        SimulatedDisk disk = new SimulatedDisk(new Random(3));
+        SegmentedFileLog log = SegmentedFileLog.open(disk, DIR, 256);
+        log.append(RaftLogContractTest.entries(1, 60, 1));
+        log.sync();
+        int before = log.segmentCount();
+        log.compactPrefix(45, 1);
+        assertThat(log.segmentCount()).isLessThan(before);
+        List<String> files = disk.list(DIR).stream().filter(n -> n.endsWith(".seg")).sorted().toList();
+        long firstStart = Long.parseLong(files.get(0).substring(4, files.get(0).length() - 4));
+        assertThat(firstStart).isLessThanOrEqualTo(46L);
+        assertThat(firstStart).isGreaterThan(1L);
+        disk.crash(CrashMode.LOSE_ALL_UNSYNCED);
+        SegmentedFileLog reopened = SegmentedFileLog.open(disk, DIR, 256);
+        assertThat(reopened.snapshotIndex()).isEqualTo(firstStart - 1);
+        assertThat(reopened.snapshotTerm()).isEqualTo(0L); // unknown until the snapshot tells it
+        reopened.compactPrefix(45, 1);
+        assertThat(reopened.entriesFrom(46, 100)).isEqualTo(RaftLogContractTest.entries(46, 60, 1));
+    }
+
+    /**
+     * Like the test above, with snapshot compaction and full resets mixed in. As in RaftNode, the
+     * snapshot is durable before {@code compactPrefix}/{@code reset} start. After the crash, the
+     * recovered log must start no later than right after the snapshot, reconcile with it the way
+     * {@code RaftNode.start} does, and still hold every synced entry after the snapshot.
+     */
+    @Property(tries = 400)
+    void compactionAndResetSurviveACrashAtAnyMoment(@ForAll long seed) {
+        Random r = new Random(seed);
+        SimulatedDisk disk = new SimulatedDisk(new Random(seed));
+        long segmentBytes = 128 + r.nextInt(600);
+        SegmentedFileLog log = SegmentedFileLog.open(disk, DIR, segmentBytes);
+
+        java.util.TreeMap<Long, LogEntry> model = new java.util.TreeMap<>();
+        java.util.TreeMap<Long, LogEntry> durable = new java.util.TreeMap<>();
+        java.util.Map<Long, List<LogEntry>> history = new java.util.HashMap<>();
+        long snapIndex = 0;
+        long snapTerm = 0;
+        long last = 0;
+        long term = 1;
+        disk.crashAtOperation(1 + r.nextInt(300));
+        try {
+            for (int step = 0; step < 80; step++) {
+                int op = r.nextInt(12);
+                if (op < 6) {
+                    if (r.nextInt(5) == 0) {
+                        term++;
+                    }
+                    List<LogEntry> batch = new ArrayList<>();
+                    int n = 1 + r.nextInt(5);
+                    for (int i = 0; i < n; i++) {
+                        LogEntry e = new LogEntry(last + 1 + i, term, EntryType.COMMAND, Bytes.ofUtf8("v" + step + "-" + i));
+                        batch.add(e);
+                        history.computeIfAbsent(e.index(), k -> new ArrayList<>()).add(e);
+                    }
+                    log.append(batch);
+                    for (LogEntry e : batch) {
+                        model.put(e.index(), e);
+                    }
+                    last += n;
+                } else if (op < 8) {
+                    log.sync();
+                    durable = new java.util.TreeMap<>(model);
+                } else if (op < 10 && last > snapIndex) {
+                    long upTo = snapIndex + 1 + r.nextInt((int) (last - snapIndex));
+                    long upToTerm = log.termAt(upTo);
+                    snapIndex = upTo; // the snapshot is durable before compaction starts
+                    snapTerm = upToTerm;
+                    model.headMap(upTo, true).clear();
+                    durable.headMap(upTo, true).clear();
+                    log.compactPrefix(upTo, upToTerm);
+                } else if (op == 10 && last > snapIndex) {
+                    long from = snapIndex + 1 + r.nextInt((int) (last - snapIndex));
+                    durable.tailMap(from, true).clear();
+                    log.truncateSuffix(from);
+                    model.tailMap(from, true).clear();
+                    last = from - 1;
+                    term++;
+                } else if (op == 11 && r.nextInt(3) == 0) {
+                    long index = Math.max(snapIndex + 1, last - 3 + r.nextInt(8));
+                    term++;
+                    snapIndex = index;
+                    snapTerm = term;
+                    model.clear();
+                    durable.clear();
+                    log.reset(index, term);
+                    last = index;
+                }
+            }
+        } catch (SimulatedDisk.SimulatedCrash expected) {
+            // the power went out
+        }
+        disk.crash(CrashMode.values()[r.nextInt(3)]);
+        SegmentedFileLog recovered = SegmentedFileLog.open(disk, DIR, segmentBytes);
+
+        assertThat(recovered.snapshotIndex()).as("seed %d: log starts after the snapshot", seed).isLessThanOrEqualTo(snapIndex);
+        if (snapIndex > 0) {
+            if (recovered.contains(snapIndex)
+                    && (snapIndex == recovered.snapshotIndex() || recovered.termAt(snapIndex) == snapTerm)) {
+                recovered.compactPrefix(snapIndex, snapTerm);
+            } else {
+                recovered.reset(snapIndex, snapTerm);
+            }
+        }
+        for (LogEntry e : durable.values()) {
+            assertThat(recovered.contains(e.index()) && e.index() > recovered.snapshotIndex())
+                    .as("seed %d: synced entry %d lost", seed, e.index()).isTrue();
+            assertThat(recovered.entryAt(e.index())).as("seed %d: synced entry %d changed", seed, e.index()).isEqualTo(e);
+        }
+        for (long i = recovered.snapshotIndex() + 1; i <= recovered.lastIndex(); i++) {
+            LogEntry got = recovered.entryAt(i);
+            List<LogEntry> written = history.getOrDefault(i, List.of());
+            assertThat(written.contains(got)).as("seed %d: entry %d was never written: %s", seed, i, got).isTrue();
+        }
+    }
 }

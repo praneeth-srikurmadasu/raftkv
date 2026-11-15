@@ -159,4 +159,41 @@ class KVStateMachineTest {
         // The visible symptom: the retry's "previous value" is the write itself.
         assertThat(KVCodec.decodeResult(retry.result())).isEqualTo(new KVResult.PutResult(Optional.of(b("v"))));
     }
+
+    @Test
+    void aRestoredSnapshotBehavesExactlyLikeTheOriginal() {
+        apply(A, 1, 1, new KVCommand.Put(b("x"), b("1")));
+        apply(A, 2, 1, new KVCommand.Put(b("y"), b("2")));
+        apply(B, 1, 1, new KVCommand.Cas(b("x"), java.util.Optional.of(b("1")), b("3")));
+        KVStateMachine copy = new KVStateMachine(Duration.ofSeconds(10), Set.of());
+        copy.apply(1, KVCodec.encode(new SessionCommand(B, 9, 1, 1, KVCodec.encode(new KVCommand.Put(b("junk"), b("!"))))));
+        copy.restore(sm.snapshot()); // replaces everything, including the junk
+        assertThat(copy.digest()).isEqualTo(sm.digest());
+        assertThat(copy.size()).isEqualTo(2);
+        assertThat(copy.executedCommands()).isEqualTo(sm.executedCommands());
+        assertThat(copy.peek(b("junk"))).isEqualTo(java.util.Optional.empty());
+
+        // A retry after the restore is still answered from the session cache, not executed again.
+        long executedBefore = copy.executedCommands();
+        KVCodec.Outcome retried = apply(copy, A, 2, 1, 0, new KVCommand.Put(b("y"), b("2")));
+        assertThat(result(retried)).isEqualTo(new KVResult.PutResult(java.util.Optional.empty()));
+        assertThat(copy.executedCommands()).isEqualTo(executedBefore);
+
+        // And both keep evolving identically.
+        apply(sm, A, 3, 3, 0, new KVCommand.Delete(b("y")));
+        apply(copy, A, 3, 3, 0, new KVCommand.Delete(b("y")));
+        assertThat(copy.digest()).isEqualTo(sm.digest());
+        assertThat(copy.snapshot()).isEqualTo(sm.snapshot());
+    }
+
+    @Test
+    void aCorruptSnapshotIsRejectedWithoutChangingState() {
+        apply(A, 1, 1, new KVCommand.Put(b("x"), b("1")));
+        long digest = sm.digest();
+        Bytes snap = sm.snapshot();
+        Bytes truncated = snap.slice(0, snap.length() - 3);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> sm.restore(truncated))
+                .isInstanceOf(dev.raftkv.codec.CodecException.class);
+        assertThat(sm.digest()).isEqualTo(digest);
+    }
 }

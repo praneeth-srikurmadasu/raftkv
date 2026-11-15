@@ -52,7 +52,7 @@ class SimulatedNetworkTest {
     }
 
     private static Message msg(long term) {
-        return new InstallSnapshotReply(term);
+        return new InstallSnapshotReply(term, 0, 0, false);
     }
 
     @Test
@@ -172,7 +172,6 @@ class SimulatedNetworkTest {
     @Test
     void rejectsProgrammingErrors() {
         Fixture f = new Fixture(9);
-        assertThatThrownBy(() -> f.send(A, A, msg(1))).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> f.transports.get(A).send(NodeId.of(42), G, msg(1)))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> f.net.register(A, e -> { })).isInstanceOf(IllegalArgumentException.class);

@@ -222,12 +222,16 @@ public final class SimulatedNetwork {
     private void send(Envelope envelope) {
         NodeId from = envelope.from();
         NodeId to = envelope.to();
-        if (from.equals(to)) {
-            throw new IllegalArgumentException(from + " tried to send a message to itself");
-        }
         requireRegistered(to);
         sent++;
         String what = envelope.message().type() + " " + from + "->" + to + " " + envelope.group();
+        if (from.equals(to)) {
+            // Within one node (e.g. a config poller asking the controller replica on the same node):
+            // no network, so no loss, but still a separate event, as with a real local hand-off.
+            sim.trace("net local " + what);
+            sim.execute(() -> deliver(envelope, null, what));
+            return;
+        }
         if (!canReach(from, to) || random.nextDouble() < dropRate) {
             dropped++;
             sim.trace("net drop " + what);

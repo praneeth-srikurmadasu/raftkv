@@ -11,31 +11,42 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
-import dev.raftkv.Main;
 import dev.raftkv.client.ClientConfig;
-import dev.raftkv.client.RaftKVClient;
+import dev.raftkv.common.Bytes;
 import dev.raftkv.common.EventLoopScheduler;
 import dev.raftkv.common.NodeId;
 import dev.raftkv.common.SystemClock;
 import dev.raftkv.config.NodeConfig;
+import dev.raftkv.shard.ControllerCommand;
+import dev.raftkv.shard.ShardConfig;
+import dev.raftkv.shard.ShardedKVClient;
+import dev.raftkv.shard.Shards;
 import dev.raftkv.transport.NioTransport;
 
 /**
- * A command-line client.
+ * A command-line client for the sharded cluster.
  *
  * <pre>
  *   java -cp target/classes dev.raftkv.client.cli.RaftKVCli --servers 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
  *   raftkv&gt; put color blue
  *   raftkv&gt; get color
+ *   raftkv&gt; config
+ *   raftkv&gt; admin move 5 2
  * </pre>
  *
- * Anything after the options is run as a single command, then the program exits (useful in
- * scripts): {@code ... RaftKVCli --servers ... put color blue}. Exit code 0 = success,
- * 1 = the command failed (e.g. no leader before the deadline), 2 = bad usage.
+ * {@code --servers} lists every server process (ids and addresses): the controller runs on them,
+ * and configurations name data-group servers by id. Anything after the options is run as a single
+ * command, then the program exits (useful in scripts). Exit code 0 = success, 1 = the command
+ * failed (e.g. no answer before the deadline), 2 = bad usage.
  */
 public final class RaftKVCli implements AutoCloseable {
 
@@ -45,7 +56,13 @@ public final class RaftKVCli implements AutoCloseable {
               get <key>                      read a key (linearizable)
               delete <key>                   remove a key
               cas <key> <expected|-> <new>   set only if the current value is <expected> ('-' = only if absent)
-              leader                         the server this client believes is leader
+              shard <key>                    which shard and group a key belongs to
+              config                         the current configuration: which group serves which shards
+              leader                         the leader this client knows for each group
+              admin join <gid> <id,id,...>   give group <gid> (one the servers were started with, see --groups)
+                                             back its share of shards; ids = the servers hosting it
+              admin leave <gid>              remove a group; its shards move to the others
+              admin move <shard> <gid>       move one shard to a group
               help                           this text
               quit                           exit""";
 
@@ -56,18 +73,20 @@ public final class RaftKVCli implements AutoCloseable {
     /** Clients use node ids far above any server id; the server replies to whatever id we announce. */
     private static final int CLIENT_ID_BASE = 1 << 24;
 
-    private final RaftKVClient client;
+    private final ShardedKVClient client;
+    private final Set<NodeId> servers;
     private final NioTransport transport;
     private final EventLoopScheduler loop;
 
     public RaftKVCli(Map<NodeId, InetSocketAddress> servers, Duration deadline) {
+        this.servers = Set.copyOf(servers.keySet());
         NodeId me = new NodeId(CLIENT_ID_BASE + new SecureRandom().nextInt(Integer.MAX_VALUE - CLIENT_ID_BASE));
         loop = new EventLoopScheduler("raftkv-cli");
-        RaftKVClient[] holder = new RaftKVClient[1];
+        ShardedKVClient[] holder = new ShardedKVClient[1];
         transport = NioTransport.client(me, servers, envelope -> holder[0].onMessage(envelope));
         ClientConfig defaults = ClientConfig.defaults();
-        holder[0] = new RaftKVClient(transport, loop, SystemClock.INSTANCE, new SecureRandom(),
-                new ArrayList<>(servers.keySet()), Main.DATA_GROUP,
+        holder[0] = new ShardedKVClient(transport, loop, SystemClock.INSTANCE, new SecureRandom(),
+                new ArrayList<>(servers.keySet()),
                 new ClientConfig(defaults.attemptTimeout(), defaults.backoffBase(), defaults.backoffMax(), deadline));
         client = holder[0];
     }
@@ -112,7 +131,7 @@ public final class RaftKVCli implements AutoCloseable {
 
     /** Reads commands until "quit" or end of input. */
     public void repl(BufferedReader in, PrintStream out) throws IOException {
-        out.println("connected to group " + Main.DATA_GROUP + "; type 'help' for commands");
+        out.println("connected; type 'help' for commands");
         while (true) {
             out.print("raftkv> ");
             out.flush();
@@ -133,7 +152,7 @@ public final class RaftKVCli implements AutoCloseable {
 
     /** Runs one command, printing the result; returns false if it failed. */
     public boolean run(List<String> words, PrintStream out) {
-        String cmd = words.get(0).toLowerCase(java.util.Locale.ROOT);
+        String cmd = words.get(0).toLowerCase(Locale.ROOT);
         try {
             switch (cmd) {
                 case "put" -> {
@@ -155,7 +174,26 @@ public final class RaftKVCli implements AutoCloseable {
                     String newValue = String.join(" ", words.subList(3, words.size()));
                     out.println(client.cas(words.get(1), expected, newValue) ? "OK" : "FAILED (value did not match)");
                 }
-                case "leader" -> out.println(client.knownLeader().map(NodeId::toString).orElse("unknown (send a command first)"));
+                case "shard" -> {
+                    need(words, 2);
+                    ShardConfig c = latestConfig();
+                    int shard = Shards.shardOf(Bytes.ofUtf8(words.get(1)), c.numShards());
+                    out.println("shard " + shard + " -> group " + c.gidOf(shard) + " (config " + c.num() + ")");
+                }
+                case "config" -> out.println(describe(latestConfig()));
+                case "leader" -> {
+                    ShardConfig c = latestConfig();
+                    StringBuilder sb = new StringBuilder();
+                    for (int gid : c.gids()) {
+                        sb.append("group ").append(gid).append(": ")
+                                .append(client.knownLeader(gid).map(NodeId::toString).orElse("unknown (no request sent yet)"))
+                                .append('\n');
+                    }
+                    out.print(sb.length() == 0 ? "no groups yet\n" : sb.toString());
+                }
+                case "admin" -> {
+                    return admin(words, out);
+                }
                 case "help" -> out.println(HELP);
                 default -> {
                     out.println("unknown command '" + cmd + "'; type 'help'");
@@ -173,7 +211,79 @@ public final class RaftKVCli implements AutoCloseable {
         }
     }
 
-    public RaftKVClient client() {
+    private boolean admin(List<String> words, PrintStream out) {
+        need(words, 2);
+        CompletableFuture<ShardConfig> result = switch (words.get(1).toLowerCase(Locale.ROOT)) {
+            case "join" -> {
+                need(words, 4);
+                List<NodeId> ids = new ArrayList<>();
+                for (String id : words.get(3).split(",")) {
+                    NodeId server = new NodeId(parseInt(id.trim().replaceFirst("^n", ""), "server id"));
+                    if (!servers.contains(server)) {
+                        // a configuration naming a server that doesn't exist would leave its shards unreachable
+                        throw new IllegalArgumentException("server " + server + " is not one of --servers " + new TreeSet<>(servers));
+                    }
+                    ids.add(server);
+                }
+                TreeMap<Integer, List<NodeId>> groups = new TreeMap<>();
+                groups.put(parseInt(words.get(2), "gid"), ids);
+                yield client.controller().join(groups);
+            }
+            case "leave" -> {
+                need(words, 3);
+                yield client.controller().leave(List.of(parseInt(words.get(2), "gid")));
+            }
+            case "move" -> {
+                need(words, 4);
+                yield client.controller().move(parseInt(words.get(2), "shard"), parseInt(words.get(3), "gid"));
+            }
+            default -> throw new IllegalArgumentException("admin needs join, leave or move; type 'help'");
+        };
+        out.println("now " + describe(result.join()));
+        return true;
+    }
+
+    private ShardConfig latestConfig() {
+        return client.controller().query(ControllerCommand.Query.LATEST).join();
+    }
+
+    /** {@code config 4: group 1 -> shards 0-20 on [n1, n2, n3]; group 2 -> ...}. */
+    static String describe(ShardConfig c) {
+        if (c.groups().isEmpty()) {
+            return "config " + c.num() + ": no groups yet (shards unassigned)";
+        }
+        StringBuilder sb = new StringBuilder("config " + c.num() + ":");
+        for (int gid : c.gids()) {
+            sb.append("\n  group ").append(gid).append(" -> shards ").append(ranges(c.shardsOf(gid)))
+                    .append(" on ").append(c.servers(gid));
+        }
+        List<Integer> unassigned = c.shardsOf(0);
+        if (!unassigned.isEmpty()) {
+            sb.append("\n  unassigned -> shards ").append(ranges(unassigned));
+        }
+        return sb.toString();
+    }
+
+    /** [0,1,2,5,7,8] -> "0-2,5,7-8". */
+    static String ranges(List<Integer> shards) {
+        if (shards.isEmpty()) {
+            return "none";
+        }
+        StringBuilder sb = new StringBuilder();
+        int start = shards.get(0);
+        int prev = start;
+        for (int i = 1; i <= shards.size(); i++) {
+            int cur = i < shards.size() ? shards.get(i) : Integer.MIN_VALUE;
+            if (cur != prev + 1) {
+                sb.append(sb.length() == 0 ? "" : ",").append(start == prev ? String.valueOf(start) : start + "-" + prev);
+                start = cur;
+            }
+            prev = cur;
+        }
+        return sb.toString();
+    }
+
+    public ShardedKVClient client() {
         return client;
     }
 
@@ -185,7 +295,16 @@ public final class RaftKVCli implements AutoCloseable {
 
     private static void need(List<String> words, int n) {
         if (words.size() < n) {
-            throw new IllegalArgumentException("'" + words.get(0) + "' needs " + (n - 1) + " argument(s); type 'help'");
+            throw new IllegalArgumentException("'" + String.join(" ", words.subList(0, Math.min(2, words.size())))
+                    + "' needs " + (n - 1) + " argument(s); type 'help'");
+        }
+    }
+
+    private static int parseInt(String s, String what) {
+        try {
+            return Integer.parseInt(s);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(what + " must be a number, got '" + s + "'", e);
         }
     }
 

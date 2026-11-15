@@ -51,7 +51,8 @@ final class ReplicationChaos {
         int size = r.nextBoolean() ? 3 : 5;
         // Small batches stress backtracking and partial matches; large ones exercise bulk catch-up.
         int batch = r.nextInt(3) == 0 ? 1 + r.nextInt(3) : 1 + r.nextInt(64);
-        SimulatedCluster c = new SimulatedCluster(seed, size, config.withMaxEntriesPerAppend(batch), Map.of(), 0, storage);
+        SimulatedCluster c = new SimulatedCluster(seed, size, SnapshotSwarm.pick(seed, config).withMaxEntriesPerAppend(batch),
+                Map.of(), 0, storage);
         Map<Long, String> acknowledged = new TreeMap<>();
         try {
             boolean partitions = r.nextInt(4) != 0;
@@ -106,7 +107,12 @@ final class ReplicationChaos {
             c.run(Duration.ofSeconds(2));
             RaftNode leader = c.awaitLeader(Duration.ofSeconds(10));
             CompletableFuture<CommitResult> marker = leader.propose(Bytes.ofUtf8("marker"));
-            c.sim.runUntil(marker::isDone, Duration.ofSeconds(5));
+            // The marker commits only once a majority has the leader's whole log. A leader that
+            // was partitioned for long can bring hundreds of entries no follower has; with batches
+            // of 1-3 entries and one AppendEntries in flight per follower, that takes many seconds
+            // of virtual time (seed 9212853049387269196: ~380 entries, ~8 s). "Eventually" is the
+            // property, so allow 60 s, as for the catch-up below.
+            c.sim.runUntil(marker::isDone, Duration.ofSeconds(60));
             if (!marker.isDone() || marker.isCompletedExceptionally()) {
                 throw new AssertionError("marker did not commit on a healthy network: " + c.runningNodes());
             }
@@ -116,11 +122,18 @@ final class ReplicationChaos {
             // (virtual, nearly free) time: the property is "eventually", not "fast".
             c.awaitAppliedEverywhere(markerIndex, Duration.ofSeconds(60));
 
-            // Identical logs and identical applied sequences up to the marker.
-            List<LogEntry> reference = c.log(leader.id()).entriesFrom(1, (int) markerIndex);
+            // Identical logs (where every node still has them: snapshots compact prefixes away) and
+            // identical applied sequences (the recording state machine's snapshots carry the full history).
+            long from = 1;
             for (RaftNode n : c.runningNodes()) {
-                if (!c.log(n.id()).entriesFrom(1, (int) markerIndex).equals(reference)) {
-                    throw new AssertionError("logs differ up to the marker: " + n.id() + " vs leader " + leader.id());
+                from = Math.max(from, c.log(n.id()).snapshotIndex() + 1);
+            }
+            if (from <= markerIndex) {
+                List<LogEntry> reference = c.log(leader.id()).entriesFrom(from, (int) (markerIndex - from + 1));
+                for (RaftNode n : c.runningNodes()) {
+                    if (!c.log(n.id()).entriesFrom(from, (int) (markerIndex - from + 1)).equals(reference)) {
+                        throw new AssertionError("logs differ up to the marker: " + n.id() + " vs leader " + leader.id());
+                    }
                 }
             }
             List<RecordingStateMachine.Applied> appliedRef = upTo(c.stateMachine(leader.id()).applied(), markerIndex);
@@ -129,12 +142,16 @@ final class ReplicationChaos {
                     throw new AssertionError("applied sequences differ: " + n.id() + " vs leader " + leader.id());
                 }
             }
-            // Acknowledged writes are durable.
+            // Acknowledged writes are durable: each is in the applied history at its acknowledged index.
+            Map<Long, Bytes> appliedAt = new TreeMap<>();
+            for (RecordingStateMachine.Applied a : appliedRef) {
+                appliedAt.put(a.index(), a.command());
+            }
             for (Map.Entry<Long, String> ack : acknowledged.entrySet()) {
-                Bytes inLog = c.log(leader.id()).entryAt(ack.getKey()).data();
-                if (!inLog.equals(Bytes.ofUtf8(ack.getValue()))) {
+                Bytes there = appliedAt.get(ack.getKey());
+                if (there == null || !there.equals(Bytes.ofUtf8(ack.getValue()))) {
                     throw new AssertionError("acknowledged write " + ack.getValue() + " at index " + ack.getKey()
-                            + " was lost (log has " + inLog.toUtf8() + ")");
+                            + " was lost (applied there: " + (there == null ? "nothing" : there.toUtf8()) + ")");
                 }
             }
             return new Result(seed, size, Optional.empty(), markerIndex, acknowledged.size());

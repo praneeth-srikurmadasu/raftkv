@@ -5,11 +5,13 @@ import java.util.List;
 
 /**
  * A {@link RaftLog} kept in an {@code ArrayList}. Fast and simple; used by unit tests and
- * simulations until the on-disk {@code SegmentedFileLog} arrives in Milestone 4.
+ * in-memory simulations. Entry {@code i} lives at position {@code i - snapshotIndex - 1}.
  */
 public final class InMemoryLog implements RaftLog {
 
     private final ArrayList<LogEntry> entries = new ArrayList<>();
+    private long snapshotIndex;
+    private long snapshotTerm;
 
     public InMemoryLog() {
     }
@@ -21,39 +23,50 @@ public final class InMemoryLog implements RaftLog {
 
     @Override
     public long lastIndex() {
-        return entries.size();
+        return snapshotIndex + entries.size();
     }
 
     @Override
     public long lastTerm() {
-        return entries.isEmpty() ? 0 : entries.get(entries.size() - 1).term();
+        return entries.isEmpty() ? snapshotTerm : entries.get(entries.size() - 1).term();
+    }
+
+    @Override
+    public long snapshotIndex() {
+        return snapshotIndex;
+    }
+
+    @Override
+    public long snapshotTerm() {
+        return snapshotTerm;
     }
 
     @Override
     public long termAt(long index) {
-        if (index == 0) {
-            return 0;
+        if (index == snapshotIndex) {
+            return snapshotTerm;
         }
         return entryAt(index).term();
     }
 
     @Override
     public LogEntry entryAt(long index) {
-        if (index < 1 || index > lastIndex()) {
-            throw new IndexOutOfBoundsException("index " + index + " outside log [1, " + lastIndex() + "]");
+        if (index <= snapshotIndex || index > lastIndex()) {
+            throw new IndexOutOfBoundsException("index " + index + " outside log [" + (snapshotIndex + 1) + ", " + lastIndex() + "]");
         }
-        return entries.get((int) (index - 1));
+        return entries.get((int) (index - snapshotIndex - 1));
     }
 
     @Override
     public List<LogEntry> entriesFrom(long fromIndex, int maxCount) {
-        if (fromIndex < 1 || fromIndex > lastIndex() + 1) {
-            throw new IndexOutOfBoundsException("fromIndex " + fromIndex + " outside [1, " + (lastIndex() + 1) + "]");
+        if (fromIndex <= snapshotIndex || fromIndex > lastIndex() + 1) {
+            throw new IndexOutOfBoundsException("fromIndex " + fromIndex + " outside [" + (snapshotIndex + 1) + ", "
+                    + (lastIndex() + 1) + "]");
         }
         if (maxCount < 0) {
             throw new IllegalArgumentException("maxCount must be >= 0");
         }
-        int from = (int) (fromIndex - 1);
+        int from = (int) (fromIndex - snapshotIndex - 1);
         int to = (int) Math.min(entries.size(), (long) from + maxCount);
         return List.copyOf(entries.subList(from, to));
     }
@@ -78,9 +91,34 @@ public final class InMemoryLog implements RaftLog {
 
     @Override
     public void truncateSuffix(long fromIndex) {
-        if (fromIndex < 1 || fromIndex > lastIndex() + 1) {
-            throw new IndexOutOfBoundsException("fromIndex " + fromIndex + " outside [1, " + (lastIndex() + 1) + "]");
+        if (fromIndex <= snapshotIndex || fromIndex > lastIndex() + 1) {
+            throw new IndexOutOfBoundsException("fromIndex " + fromIndex + " outside [" + (snapshotIndex + 1) + ", "
+                    + (lastIndex() + 1) + "]");
         }
-        entries.subList((int) (fromIndex - 1), entries.size()).clear();
+        entries.subList((int) (fromIndex - snapshotIndex - 1), entries.size()).clear();
+    }
+
+    @Override
+    public void compactPrefix(long upToIndex, long upToTerm) {
+        if (!contains(upToIndex)) {
+            throw new IndexOutOfBoundsException("cannot compact to " + upToIndex + ": log holds [" + snapshotIndex + ", "
+                    + lastIndex() + "]");
+        }
+        if (termAt(upToIndex) != upToTerm) {
+            throw new IllegalArgumentException("term at " + upToIndex + " is " + termAt(upToIndex) + ", not " + upToTerm);
+        }
+        entries.subList(0, (int) (upToIndex - snapshotIndex)).clear();
+        snapshotIndex = upToIndex;
+        snapshotTerm = upToTerm;
+    }
+
+    @Override
+    public void reset(long index, long term) {
+        if (index < 0 || term < 0 || (index == 0) != (term == 0)) {
+            throw new IllegalArgumentException("bad snapshot position " + index + "@t" + term);
+        }
+        entries.clear();
+        snapshotIndex = index;
+        snapshotTerm = term;
     }
 }

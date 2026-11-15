@@ -66,10 +66,16 @@ class PersistenceTest {
         CompletableFuture<CommitResult> marker = leader.propose(Bytes.ofUtf8("marker"));
         c.sim.runUntil(marker::isDone, Duration.ofSeconds(5));
         c.awaitAppliedEverywhere(marker.join().index(), Duration.ofSeconds(30));
+        // Check against the leader's applied history (which survives snapshots), not its log.
+        Map<Long, Bytes> appliedAt = new TreeMap<>();
+        for (RecordingStateMachine.Applied a : c.stateMachine(leader.id()).applied()) {
+            appliedAt.put(a.index(), a.command());
+        }
         for (Map.Entry<Long, String> ack : acknowledged.entrySet()) {
-            Bytes inLog = c.log(leader.id()).entryAt(ack.getKey()).data();
-            if (!inLog.equals(Bytes.ofUtf8(ack.getValue()))) {
-                return Optional.of("acknowledged " + ack.getValue() + " at " + ack.getKey() + " lost; log has " + inLog.toUtf8());
+            Bytes there = appliedAt.get(ack.getKey());
+            if (there == null || !there.equals(Bytes.ofUtf8(ack.getValue()))) {
+                return Optional.of("acknowledged " + ack.getValue() + " at " + ack.getKey() + " lost; applied there: "
+                        + (there == null ? "nothing" : there.toUtf8()));
             }
         }
         if (acknowledged.size() < 100) {

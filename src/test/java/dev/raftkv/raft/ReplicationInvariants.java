@@ -72,7 +72,7 @@ final class ReplicationInvariants implements Runnable {
             }
 
             // Log Matching, by induction over (index, term) -> (content, predecessor term).
-            for (long i = Math.max(1, dirty); i <= log.lastIndex(); i++) {
+            for (long i = Math.max(log.snapshotIndex() + 1, dirty); i <= log.lastIndex(); i++) {
                 LogEntry e = log.entryAt(i);
                 Content c = new Content(e.type(), e.data(), log.termAt(i - 1));
                 Content earlier = seenEntries.putIfAbsent(new Key(i, e.term()), c);
@@ -89,6 +89,9 @@ final class ReplicationInvariants implements Runnable {
                 throw new AssertionError(n.id() + " commitIndex went backwards: " + before + " -> " + commit);
             }
             for (long i = before + 1; i <= commit; i++) {
+                if (i < log.snapshotIndex()) {
+                    continue; // compacted into a snapshot (a restarted node starts with commitIndex there)
+                }
                 long term = log.termAt(i);
                 committedInTerm.putIfAbsent(i, n.currentTerm()); // the first node to commit i is its leader
                 Long earlier = committedTerm.putIfAbsent(i, term);
@@ -107,6 +110,9 @@ final class ReplicationInvariants implements Runnable {
             Long term = committedTerm.get(i);
             if (term == null || committedInTerm.get(i) >= leader.currentTerm()) {
                 continue; // Leader Completeness only binds leaders of later terms
+            }
+            if (i < log.snapshotIndex()) {
+                continue; // covered by the leader's snapshot (State Machine Safety checks those)
             }
             if (i > log.lastIndex() || !Objects.equals(log.termAt(i), term)) {
                 throw new AssertionError("Leader Completeness violated: new leader " + leader.id() + " of t"

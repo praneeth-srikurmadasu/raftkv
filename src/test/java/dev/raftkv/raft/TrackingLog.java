@@ -83,6 +83,27 @@ final class TrackingLog implements RaftLog {
     }
 
     @Override
+    public long snapshotIndex() {
+        return delegate.snapshotIndex();
+    }
+
+    @Override
+    public long snapshotTerm() {
+        return delegate.snapshotTerm();
+    }
+
+    @Override
+    public void compactPrefix(long upToIndex, long upToTerm) {
+        delegate.compactPrefix(upToIndex, upToTerm); // no entry changes: nothing new to check
+    }
+
+    @Override
+    public void reset(long index, long term) {
+        dirtyFrom = Math.min(dirtyFrom, index + 1);
+        delegate.reset(index, term);
+    }
+
+    @Override
     public void truncateSuffix(long fromIndex) {
         if (fromIndex <= delegate.lastIndex()) {
             dirtyFrom = Math.min(dirtyFrom, fromIndex);

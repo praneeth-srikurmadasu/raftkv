@@ -1,6 +1,7 @@
 package dev.raftkv.kv;
 
 import java.util.Objects;
+import java.util.function.Consumer;
 
 import dev.raftkv.codec.CodecException;
 import dev.raftkv.common.Bytes;
@@ -19,7 +20,9 @@ import dev.raftkv.transport.Transport;
 
 /**
  * The client-facing side of one replica (SPEC §4): turns {@link ClientRequest}s into Raft
- * proposals and Raft results into {@link ClientReply}s.
+ * proposals and Raft results into {@link ClientReply}s. It serves any state machine that takes
+ * {@link SessionCommand} entries and answers with {@link KVCodec.Outcome}s: the single-group KV
+ * store, and the shard controller (with its own command validator).
  *
  * <ul>
  *   <li>Not the leader → reply NOT_LEADER with a hint; the client retries there with the
@@ -39,7 +42,11 @@ public final class KVServer {
     private final Clock clock;
     private final GroupId group;
     private final KVStateMachine localStore;
+    private final Consumer<Bytes> validator;
     private long requests;
+
+    /** Checks a command before it costs a log entry; throws {@link CodecException} if it is invalid. */
+    public static final Consumer<Bytes> KV_COMMANDS = KVCodec::decodeCommand;
 
     public KVServer(RaftNode raft, Transport transport, Clock clock) {
         this(raft, transport, clock, null);
@@ -50,6 +57,14 @@ public final class KVServer {
      *                   path ({@link Bug#READ_FROM_LOCAL_STATE}) in tests, may be null
      */
     public KVServer(RaftNode raft, Transport transport, Clock clock, KVStateMachine localStore) {
+        this(raft, transport, clock, localStore, KV_COMMANDS);
+    }
+
+    /**
+     * @param validator rejects malformed commands (throws {@link CodecException}) before they are proposed
+     */
+    public KVServer(RaftNode raft, Transport transport, Clock clock, KVStateMachine localStore, Consumer<Bytes> validator) {
+        this.validator = Objects.requireNonNull(validator, "validator");
         this.raft = Objects.requireNonNull(raft, "raft");
         this.transport = Objects.requireNonNull(transport, "transport");
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -67,13 +82,13 @@ public final class KVServer {
             return;
         }
         if (raft.role() != Role.LEADER) {
-            reply(envelope, new ClientReply(request.sequence(), ClientStatus.NOT_LEADER, raft.leaderId().orElse(null), Bytes.EMPTY));
+            reply(envelope, ClientReply.to(request, ClientStatus.NOT_LEADER, raft.leaderId().orElse(null), Bytes.EMPTY));
             return;
         }
         try {
-            KVCodec.decodeCommand(request.command()); // validate before it costs a log entry
+            validator.accept(request.command()); // validate before it costs a log entry
         } catch (CodecException e) {
-            reply(envelope, new ClientReply(request.sequence(), ClientStatus.INVALID_REQUEST, null, Bytes.EMPTY));
+            reply(envelope, ClientReply.to(request, ClientStatus.INVALID_REQUEST, null, Bytes.EMPTY));
             return;
         }
         SessionCommand entry = new SessionCommand(request.clientId(), request.sequence(), request.ackedBelow(),
@@ -81,12 +96,12 @@ public final class KVServer {
         raft.propose(KVCodec.encode(entry)).whenComplete((committed, error) -> {
             if (error == null) {
                 KVCodec.Outcome outcome = KVCodec.decodeOutcome(committed.result());
-                reply(envelope, new ClientReply(request.sequence(), outcome.status(), null, outcome.result()));
+                reply(envelope, ClientReply.to(request, outcome.status(), null, outcome.result()));
             } else {
                 // The only way a proposal fails is losing (or never having) leadership.
                 Throwable cause = error.getCause() != null ? error.getCause() : error;
                 NodeId hint = cause instanceof NotLeaderException nle ? nle.leaderHint().orElse(null) : null;
-                reply(envelope, new ClientReply(request.sequence(), ClientStatus.NOT_LEADER, hint, Bytes.EMPTY));
+                reply(envelope, ClientReply.to(request, ClientStatus.NOT_LEADER, hint, Bytes.EMPTY));
             }
         });
     }
@@ -103,7 +118,7 @@ public final class KVServer {
             return false;
         }
         Bytes result = KVCodec.encode(new KVResult.GetResult(localStore.peek(get.key())));
-        reply(envelope, new ClientReply(request.sequence(), ClientStatus.OK, null, result));
+        reply(envelope, ClientReply.to(request, ClientStatus.OK, null, result));
         return true;
     }
 

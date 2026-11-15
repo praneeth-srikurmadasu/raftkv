@@ -19,7 +19,7 @@ class RaftKVCliTest {
 
     @Test
     void runsEveryCommandAgainstARealCluster() throws IOException {
-        try (LocalCluster cluster = new LocalCluster(3);
+        try (LocalCluster cluster = new LocalCluster(3, 2);
              RaftKVCli cli = new RaftKVCli(cluster.addresses(), Duration.ofSeconds(30))) {
             String script = String.join("\n",
                     "help",
@@ -36,6 +36,10 @@ class RaftKVCliTest {
                     "put onlykey",
                     "frobnicate",
                     "leader",
+                    "config",
+                    "shard fresh",
+                    "admin move 0 2",
+                    "admin bogus",
                     "quit",
                     "get fresh") + "\n";
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -56,20 +60,35 @@ class RaftKVCliTest {
             assertThat(lines[11].trim()).isEqualTo("(not found)");
             assertThat(lines[12]).contains("needs 2 argument(s)");
             assertThat(lines[13]).contains("unknown command 'frobnicate'");
-            assertThat(lines[14].trim().matches("n[1-3]")).as("leader line %s", lines[14]).isTrue();
-            assertThat(lines[15]).isEqualTo(""); // the prompt for "quit"; nothing ran after it
-            assertThat(lines.length).isEqualTo(16);
+            assertThat(lines[14]).contains("group 1:");
+            assertThat(lines[14]).contains("group 2:");
+            assertThat(lines[15]).contains("group 1 -> shards");
+            assertThat(lines[15]).contains("on [n1, n2, n3]");
+            assertThat(lines[16]).contains("-> group");
+            assertThat(lines[17]).contains("now config");
+            assertThat(lines[18]).contains("admin needs join, leave or move");
+            assertThat(lines[19]).isEqualTo(""); // the prompt for "quit"; nothing ran after it
+            assertThat(lines.length).isEqualTo(20);
+            assertThat(cli.client().get("fresh").orElseThrow()).isEqualTo("new"); // shard 0 moved, data intact
         }
     }
 
     @Test
+    void rangesAreCompact() {
+        assertThat(RaftKVCli.ranges(java.util.List.of(0, 1, 2, 5, 7, 8))).isEqualTo("0-2,5,7-8");
+        assertThat(RaftKVCli.ranges(java.util.List.of(3))).isEqualTo("3");
+        assertThat(RaftKVCli.ranges(java.util.List.of())).isEqualTo("none");
+    }
+
+    @Test
     void oneShotCommandsReportSuccessAsABoolean() {
-        try (LocalCluster cluster = new LocalCluster(3);
+        try (LocalCluster cluster = new LocalCluster(3, 2);
              RaftKVCli cli = new RaftKVCli(cluster.addresses(), Duration.ofSeconds(30))) {
             PrintStream sink = new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8);
             assertThat(cli.run(List.of("put", "a", "1"), sink)).isTrue();
             assertThat(cli.run(List.of("get"), sink)).isFalse();
             assertThat(cli.run(List.of("nope"), sink)).isFalse();
+            assertThat(cli.run(List.of("admin", "join", "4", "n9"), sink)).as("unknown server id").isFalse();
             assertThat(cli.client().get("a").orElseThrow()).isEqualTo("1");
         }
     }

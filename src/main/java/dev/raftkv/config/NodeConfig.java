@@ -9,18 +9,21 @@ import java.util.Objects;
 import java.util.TreeMap;
 
 import dev.raftkv.common.NodeId;
+import dev.raftkv.shard.Shards;
 
 /**
  * How one server process is started (SPEC §5.3). Parsed from command-line arguments:
  *
  * <pre>
- *   --id 1 --peers 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003 [--data data/n1] [--listen 0.0.0.0:7001] [--verbose]
+ *   --id 1 --peers 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003 [--groups 3] [--shards 64] [--data data/n1] [--listen 0.0.0.0:7001] [--verbose]
  * </pre>
  *
  * <ul>
  *   <li>{@code --peers} lists every member of the cluster <em>including this node</em>.</li>
  *   <li>{@code --listen} defaults to this node's own address in {@code --peers}.</li>
  *   <li>{@code --data} defaults to {@code data/n<id>}.</li>
+ *   <li>Every process hosts a replica of the shard controller (group 0) and of each data group
+ *       {@code 1..--groups}; {@code --shards} must be the same on every process, forever.</li>
  * </ul>
  *
  * @param id      this node
@@ -28,9 +31,13 @@ import dev.raftkv.common.NodeId;
  * @param listen  address to accept connections on
  * @param dataDir where the Raft log and metadata live
  * @param verbose also log the very frequent events (commits)
+ * @param groups  number of data groups (ids 1..groups)
+ * @param shards  number of shards
  */
 public record NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSocketAddress listen,
-                         Path dataDir, boolean verbose) {
+                         Path dataDir, boolean verbose, int groups, int shards) {
+
+    public static final int DEFAULT_GROUPS = 3;
 
     public NodeConfig {
         Objects.requireNonNull(id, "id");
@@ -39,13 +46,21 @@ public record NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSo
         if (!peers.containsKey(id)) {
             throw new IllegalArgumentException("--peers must include this node (" + id.value() + ")");
         }
+        if (groups < 1 || groups > 1000) {
+            throw new IllegalArgumentException("--groups must be between 1 and 1000");
+        }
+        if (shards < 1 || shards > 65536) {
+            throw new IllegalArgumentException("--shards must be between 1 and 65536");
+        }
         peers = Collections.unmodifiableMap(new TreeMap<>(peers));
     }
 
     public static final String USAGE = """
-            usage: raftkv --id <n> --peers <id=host:port,...> [--data <dir>] [--listen <host:port>] [--verbose]
+            usage: raftkv --id <n> --peers <id=host:port,...> [--groups <g>] [--shards <n>] [--data <dir>] [--listen <host:port>] [--verbose]
               --id       this node's id (a number listed in --peers)
               --peers    every cluster member including this one, e.g. 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003
+              --groups   number of data groups, each replicated on every peer (default: 3)
+              --shards   number of shards; must never change for a cluster (default: 64)
               --data     data directory (default: data/n<id>)
               --listen   address to listen on (default: this node's address from --peers)
               --verbose  also log every commit""";
@@ -58,7 +73,7 @@ public record NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSo
             String a = args[i];
             switch (a) {
                 case "--verbose" -> verbose = true;
-                case "--id", "--peers", "--data", "--listen" -> {
+                case "--id", "--peers", "--data", "--listen", "--groups", "--shards" -> {
                     if (i + 1 >= args.length) {
                         throw new IllegalArgumentException(a + " needs a value");
                     }
@@ -82,7 +97,9 @@ public record NodeConfig(NodeId id, Map<NodeId, InetSocketAddress> peers, InetSo
         }
         InetSocketAddress listen = opts.containsKey("--listen") ? parseAddress(opts.get("--listen")) : peers.get(id);
         Path data = Path.of(opts.getOrDefault("--data", "data/n" + id.value()));
-        return new NodeConfig(id, peers, listen, data, verbose);
+        int groups = opts.containsKey("--groups") ? parseInt(opts.get("--groups"), "--groups") : DEFAULT_GROUPS;
+        int shards = opts.containsKey("--shards") ? parseInt(opts.get("--shards"), "--shards") : Shards.DEFAULT_COUNT;
+        return new NodeConfig(id, peers, listen, data, verbose, groups, shards);
     }
 
     /** Parses {@code 1=host:port,2=host:port}. */

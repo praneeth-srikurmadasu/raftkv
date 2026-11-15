@@ -44,5 +44,18 @@ public enum Bug {
     // ---- Milestone 6: linearizability
 
     /** Any server answers GET straight from its own state machine, without the log or a leadership check. */
-    READ_FROM_LOCAL_STATE
+    READ_FROM_LOCAL_STATE,
+
+    // ---- Milestone 10: shard migration
+
+    /** A shard moves without its session table, so a retry that reaches the new owner executes again. */
+    SESSIONS_NOT_MIGRATED,
+    /** The old owner keeps serving a shard it has frozen for the new owner (BEPULLING). */
+    SERVE_WHILE_BEPULLING,
+    /** A group jumps straight to the latest configuration instead of applying them one by one. */
+    SKIP_CONFIG_NUMBERS,
+    /** The new owner tells the old one to delete a shard as soon as it fetched it, before installing it. */
+    GC_BEFORE_INSERT_COMMITTED,
+    /** Shard ownership is checked when a request arrives but not again when it is applied. */
+    CHECK_OWNERSHIP_ON_RECEIVE_ONLY
 }

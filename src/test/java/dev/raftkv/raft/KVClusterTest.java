@@ -232,4 +232,30 @@ class KVClusterTest {
             assertThat(c.await(client.getAsync(b("k" + i)), WAIT)).as("seed %d", seed).isEqualTo(Optional.of(b("v" + i)));
         }
     }
+
+    /**
+     * Regression (found by the sharded chaos test in Milestone 10): a client whose first request
+     * timed out without ever reaching a server must still be able to use the cluster afterwards.
+     * It used to send a watermark above 1 next time, which the servers read as "this session
+     * expired" and refused forever.
+     */
+    @Test
+    void aClientWhoseFirstRequestsNeverArrivedCanStillWorkLater() {
+        long seed = Seeds.resolve();
+        SimulatedCluster c = SimulatedCluster.kv(seed, 3, CONFIG, SimulatedCluster.Storage.MEMORY);
+        c.startAllExcept(c.ids);
+        RaftKVClient client = c.newClient(new ClientConfig(Duration.ofMillis(100), Duration.ofMillis(10),
+                Duration.ofMillis(100), Duration.ofSeconds(1)));
+        for (int i = 0; i < 3; i++) {
+            CompletableFuture<Optional<Bytes>> lost = client.putAsync(b("a"), b("lost" + i));
+            c.sim.runUntil(lost::isDone, WAIT);
+            assertThatThrownBy(lost::join).isInstanceOf(CompletionException.class);
+        }
+        for (NodeId id : c.ids) {
+            c.restart(id);
+        }
+        c.awaitLeader(Duration.ofSeconds(5));
+        assertThat(c.await(client.putAsync(b("a"), b("1")), WAIT)).as("seed %d", seed).isEqualTo(Optional.empty());
+        assertThat(c.await(client.getAsync(b("a")), WAIT)).isEqualTo(Optional.of(b("1")));
+    }
 }

@@ -92,7 +92,7 @@ final class LinearizabilityChaos {
 
     static Result run(long seed, RaftConfig config, SimulatedCluster.Storage storage) {
         Random r = new Random(seed);
-        SimulatedCluster c = SimulatedCluster.kv(seed, r.nextBoolean() ? 3 : 5, config, storage);
+        SimulatedCluster c = SimulatedCluster.kv(seed, r.nextBoolean() ? 3 : 5, SnapshotSwarm.pick(seed, config), storage);
         History history = new History(c.sim::now);
         try {
             // ---- swarm: which faults are on in this run

@@ -41,11 +41,15 @@ class MessageCodecTest {
                         new LogEntry(10, 3, EntryType.CONFIGURATION, Bytes.copyOf(new byte[] {1, 2}))), 9),
                 new AppendEntriesReply(3, false, 0, 4, 2),
                 new InstallSnapshot(9, N1, 1000, 8, 65536, Bytes.copyOf(new byte[100]), true),
-                new InstallSnapshotReply(9),
+                new InstallSnapshotReply(9, 1000, 65636, false),
                 new TimeoutNow(4, N1),
                 new ClientRequest(new java.util.UUID(1, 2), 7, 5, Bytes.ofUtf8("PUT a b")),
-                new ClientReply(7, ClientStatus.OK, null, Bytes.ofUtf8("result")),
-                new ClientReply(8, ClientStatus.NOT_LEADER, N1, Bytes.EMPTY));
+                new ClientReply(new java.util.UUID(3, 4), 7, ClientStatus.OK, null, Bytes.ofUtf8("result")),
+                new ClientReply(new java.util.UUID(3, 4), 8, ClientStatus.NOT_LEADER, N1, Bytes.EMPTY),
+                new FetchShard(4, 2, java.util.List.of(0, 7, 63)),
+                new FetchShardReply(4, true, Bytes.ofUtf8("shard bytes")),
+                new DeleteShard(4, 2, java.util.List.of(7)),
+                new DeleteShardReply(4, true, java.util.List.of()));
     }
 
     @Test
@@ -98,7 +102,7 @@ class MessageCodecTest {
 
     @Test
     void trailingBytesAreRejected() {
-        Message m = new InstallSnapshotReply(1);
+        Message m = new InstallSnapshotReply(1, 2, 3, true);
         byte[] full = MessageCodec.encode(m).toArray();
         Bytes longer = Bytes.copyOf(Arrays.copyOf(full, full.length + 1));
         assertThatThrownBy(() -> MessageCodec.decode(m.type(), longer))
@@ -124,7 +128,7 @@ class MessageCodecTest {
 
     @Test
     void wellFormedButInvalidValuesBecomeCodecExceptions() {
-        Bytes negativeTerm = new BinaryWriter().writeLong(-5).toBytes();
+        Bytes negativeTerm = new BinaryWriter().writeLong(-5).writeLong(0).writeLong(0).writeBoolean(false).toBytes();
         assertThatThrownBy(() -> MessageCodec.decode(MessageType.INSTALL_SNAPSHOT_REPLY, negativeTerm))
                 .isInstanceOf(CodecException.class).hasMessageContaining("term");
 
@@ -166,6 +170,12 @@ class MessageCodecTest {
         assertThat(MessageType.TIMEOUT_NOW.code()).isEqualTo((short) 7);
         assertThat(MessageType.CLIENT_REQUEST.code()).isEqualTo((short) 100);
         assertThat(MessageType.CLIENT_REPLY.code()).isEqualTo((short) 101);
+        assertThat(MessageType.FETCH_SHARD.code()).isEqualTo((short) 110);
+        assertThat(MessageType.FETCH_SHARD_REPLY.code()).isEqualTo((short) 111);
+        assertThat(MessageType.DELETE_SHARD.code()).isEqualTo((short) 112);
+        assertThat(MessageType.DELETE_SHARD_REPLY.code()).isEqualTo((short) 113);
+        assertThat(ClientStatus.WRONG_GROUP.code()).isEqualTo((byte) 4);
+        assertThat(ClientStatus.SHARD_NOT_READY.code()).isEqualTo((byte) 5);
         assertThat(ClientStatus.OK.code()).isEqualTo((byte) 0);
         assertThat(ClientStatus.NOT_LEADER.code()).isEqualTo((byte) 1);
         assertThat(ClientStatus.SESSION_EXPIRED.code()).isEqualTo((byte) 2);

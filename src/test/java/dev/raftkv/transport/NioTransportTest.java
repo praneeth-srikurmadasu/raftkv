@@ -102,7 +102,7 @@ class NioTransportTest {
         NioTransport[] server = new NioTransport[1];
         try (NioTransport s = NioTransport.start(B, ANY, Map.of(), e -> {
                  ClientRequest r = (ClientRequest) e.message();
-                 server[0].send(e.from(), e.group(), new ClientReply(r.sequence(), ClientStatus.OK, null, Bytes.ofUtf8("ok")));
+                 server[0].send(e.from(), e.group(), ClientReply.to(r, ClientStatus.OK, null, Bytes.ofUtf8("ok")));
              })) {
             server[0] = s;
             try (NioTransport c = NioTransport.client(client, Map.of(B, s.localAddress()), atClient::add)) {
@@ -206,6 +206,18 @@ class NioTransportTest {
             Thread.sleep(300);
             assertThat(a.framesSent()).isEqualTo(0L);
             assertThat(atImpostor.isEmpty()).isTrue();
+        }
+    }
+
+    @Test
+    void aMessageToItselfIsDeliveredLocally() throws Exception {
+        BlockingQueue<Envelope> atA = new LinkedBlockingQueue<>();
+        try (NioTransport a = NioTransport.start(A, ANY, Map.of(), atA::add)) {
+            a.send(A, G, request(5));
+            Envelope e = poll(atA);
+            assertThat(e.from()).isEqualTo(A);
+            assertThat(e.to()).isEqualTo(A);
+            assertThat(e.message()).isEqualTo(request(5));
         }
     }
 }
